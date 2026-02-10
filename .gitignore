@@ -60,3 +60,6 @@ backend/dji_thermal_sdk/utility/bin/
 .env
 .env.*
 !.env.example
+
+# Local backups
+backups/
