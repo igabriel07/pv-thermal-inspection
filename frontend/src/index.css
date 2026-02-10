@@ -1,0 +1,51 @@
+html,
+body,
+#root {
+  height: 100%;
+}
+
+:root {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #111827;
+  background-color: #f3f6fb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  overflow: hidden;
+  background: radial-gradient(1200px 600px at 10% -10%, #e8f0ff 0%, transparent 55%),
+    radial-gradient(900px 500px at 90% -20%, #eef7ff 0%, transparent 55%),
+    #f3f6fb;
+}
+
+body.theme-light {
+  background: #ffffff;
+  color: #0f172a;
+}
+
+body.theme-dark {
+  background: #1f2937;
+  color: #e5e7eb;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}

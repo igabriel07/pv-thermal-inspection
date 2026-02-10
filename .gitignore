@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Node / Vite
+**/node_modules/
+**/dist/
+**/dist-ssr/
+**/.vite/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Runtime data / outputs (keep out of git)
+data/
+backend/thermal_out/
+backend/static/orthomosaic_sessions/
+backend/*.tiff
+backend/*.tif
+backend/*.jpg
+backend/*.png
+
+# Large binaries / ML weights (use Git LFS if you really need them in repo)
+**/*.pt
+**/*.pth
+**/*.onnx
+**/*.engine
+**/*.weights
+
+# Vendor SDK data (keep source, ignore bulky datasets/samples)
+backend/dji_thermal_sdk/dataset/
+backend/dji_thermal_sdk/sample/
+
+# Vendor SDK generated docs + bundled binaries (often huge / licensing concerns)
+backend/dji_thermal_sdk/doc/
+backend/dji_thermal_sdk/tsdk-core/lib/
+backend/dji_thermal_sdk/utility/bin/
+
+# Local env files
+.env
+.env.*
+!.env.example

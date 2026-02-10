@@ -1,0 +1,1 @@
+"""Orthomosaic tests removed."""
