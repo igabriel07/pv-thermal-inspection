@@ -57,16 +57,16 @@ $excludeDirs = @(
 
 if (-not $IncludeData) {
     $excludeDirs += 'data'
-    $excludeDirs += (Join-Path 'backend' 'thermal_out')
-    $excludeDirs += (Join-Path 'backend' 'static' 'orthomosaic_sessions')
+    $excludeDirs += [IO.Path]::Combine('backend', 'thermal_out')
+    $excludeDirs += [IO.Path]::Combine('backend', 'static', 'orthomosaic_sessions')
 }
 
 if (-not $IncludeVendorSdk) {
-    $excludeDirs += (Join-Path 'backend' 'dji_thermal_sdk' 'doc')
-    $excludeDirs += (Join-Path 'backend' 'dji_thermal_sdk' 'dataset')
-    $excludeDirs += (Join-Path 'backend' 'dji_thermal_sdk' 'sample')
-    $excludeDirs += (Join-Path 'backend' 'dji_thermal_sdk' 'tsdk-core' 'lib')
-    $excludeDirs += (Join-Path 'backend' 'dji_thermal_sdk' 'utility' 'bin')
+    $excludeDirs += [IO.Path]::Combine('backend', 'dji_thermal_sdk', 'doc')
+    $excludeDirs += [IO.Path]::Combine('backend', 'dji_thermal_sdk', 'dataset')
+    $excludeDirs += [IO.Path]::Combine('backend', 'dji_thermal_sdk', 'sample')
+    $excludeDirs += [IO.Path]::Combine('backend', 'dji_thermal_sdk', 'tsdk-core', 'lib')
+    $excludeDirs += [IO.Path]::Combine('backend', 'dji_thermal_sdk', 'utility', 'bin')
 }
 
 # Normalize excludes to full paths
