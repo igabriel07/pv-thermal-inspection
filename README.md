@@ -1,6 +1,6 @@
-# FastAPI + React (Vite)
+# Thermal Fault Detection + Labeling (FastAPI + React)
 
-Simple one-page app with a left menu and a React frontend calling a FastAPI backend.
+React (Vite) frontend + FastAPI backend for scanning images for faults, reviewing detections, editing labels, and generating reports.
 
 This repo is structured as a small monorepo:
 - `backend/` = FastAPI API (serves `/api/*`)
@@ -13,6 +13,10 @@ This repo is structured as a small monorepo:
 - `pip install -r backend/requirements.txt`
 3) Run:
 - `uvicorn backend.main:app --reload --port 8000`
+
+Faster local dev tips:
+- Skip the heavy YOLO preload on startup: `PRELOAD_MODEL=0 uvicorn backend.main:app --reload --port 8000`
+- Disable reload (often faster on Windows): `uvicorn backend.main:app --port 8000`
 
 Optional environment variables (see `.env.example`):
 - `CORS_ALLOW_ORIGINS` (comma-separated, or `*`)

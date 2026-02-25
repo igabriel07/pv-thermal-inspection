@@ -4,3 +4,6 @@ pytest==8.3.4
 numpy==1.26.4
 opencv-python==4.10.0.84
 ultralytics==8.2.0
+pillow==10.4.0
+tifffile==2024.8.30
+qrcode[pil]==7.4.2

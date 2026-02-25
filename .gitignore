@@ -63,3 +63,12 @@ backend/dji_thermal_sdk/utility/bin/
 
 # Local backups
 backups/
+
+# Logs
+*.log
+
+# Local analysis/probe outputs
+backend/*.probe.json
+
+# Local script artifacts
+scripts/quick_mosaic*

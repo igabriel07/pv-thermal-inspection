@@ -3,21 +3,32 @@
 
 """
 check_for_metadata_tiff.py
+
 Δώσε ένα .tif/.tiff και θα σου δείξει:
 - Metadata από ExifTool (αν υπάρχει εγκατεστημένο) -> EXIF/XMP/MakerNotes
 - Metadata από Pillow (fallback)
 - DJI XMP που είναι μέσα στο XMLPacket (ακόμα και χωρίς ExifTool)
 - Pixel stats (min/mean/max) από tifffile (raw, εδώ μοιάζουν με °C αν είναι float)
 - Αποθήκευση πλήρους JSON report χωρίς σφάλματα serialization
+- Κατηγοριοποιημένο output (image_info, device, timestamps, geolocation, flight, measurement_params, temps, pixel_data)
+- Προαιρετικά: QR code PNG με Google Maps link από τις συντεταγμένες
+
+ΣΗΜΑΝΤΙΚΟ FIX:
+- Δεν χρησιμοποιούμε ΠΟΤΕ RtkStdLat/Lon ως συντεταγμένες (είναι std-dev/accuracy).
+- Προτιμάμε ExifTool Composite:GPSLatitude/Longitude ή GPS:GPSLatitude/Longitude
+- Robust parsing (DMS / N,S,E,W) + sanity checks lat/lon bounds
 
 Χρήση:
   python check_for_metadata_tiff.py "C:\\path\\file.tiff"
   python check_for_metadata_tiff.py "C:\\path\\file.tiff" --out report.json
+  python check_for_metadata_tiff.py "C:\\path\\file.tiff" --qr
+  python check_for_metadata_tiff.py "C:\\path\\file.tiff" --qr --qr-out "C:\\path\\maps_qr.png"
 
 Απαιτήσεις:
   pip install pillow tifffile numpy
 Προαιρετικά (συνιστάται):
-  εγκατάσταση ExifTool (ώστε να πάρεις GPS/Distance/Emissivity κλπ πιο εύκολα)
+  εγκατάσταση ExifTool
+  pip install qrcode[pil]   (για QR)
 """
 
 import argparse
@@ -42,6 +53,11 @@ try:
 except Exception:
     tifffile = None
 
+try:
+    import qrcode
+except Exception:
+    qrcode = None
+
 import xml.etree.ElementTree as ET
 
 
@@ -54,15 +70,12 @@ def to_jsonable(x: Any) -> Any:
     if x is None:
         return None
 
-    # numpy scalars
     if isinstance(x, (np.integer, np.floating, np.bool_)):
         return x.item()
 
-    # numpy arrays
     if isinstance(x, np.ndarray):
         return x.tolist()
 
-    # bytes -> try decode (utf-16le often used in XP*), else hex
     if isinstance(x, (bytes, bytearray)):
         b = bytes(x)
         for enc in ("utf-16le", "utf-8", "latin-1"):
@@ -75,7 +88,6 @@ def to_jsonable(x: Any) -> Any:
                 pass
         return b.hex()
 
-    # PIL IFDRational or Fraction-like
     if hasattr(x, "numerator") and hasattr(x, "denominator"):
         try:
             n = int(x.numerator)
@@ -86,15 +98,12 @@ def to_jsonable(x: Any) -> Any:
         except Exception:
             pass
 
-    # tuples/lists
     if isinstance(x, (list, tuple)):
         return [to_jsonable(v) for v in x]
 
-    # dict
     if isinstance(x, dict):
         return {str(k): to_jsonable(v) for k, v in x.items()}
 
-    # primitives
     if isinstance(x, (str, int, float, bool)):
         return x
 
@@ -111,8 +120,7 @@ def which_exiftool() -> Optional[str]:
 
 def run_exiftool_json(path: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
-    Επιστρέφει (metadata_dict, error_message)
-    metadata_dict: dict tags όπως τα δίνει το exiftool -j -G1 -a -s -u -ee
+    Returns (metadata_dict, error_message)
     """
     exiftool = which_exiftool()
     if not exiftool:
@@ -136,9 +144,6 @@ def run_exiftool_json(path: str) -> Tuple[Optional[Dict[str, Any]], Optional[str
 # -----------------------------
 
 def _dms_to_deg(dms) -> Optional[float]:
-    """
-    dms: (deg, min, sec) where each may be rational-like
-    """
     try:
         d, m, s = dms
         d = to_jsonable(d)
@@ -152,9 +157,6 @@ def _dms_to_deg(dms) -> Optional[float]:
 
 
 def decode_gpsinfo_if_possible(gps_ifd: Any) -> Dict[str, Any]:
-    """
-    Decode GPSInfo IFD (numeric keys) into decimal lat/lon if possible.
-    """
     if not isinstance(gps_ifd, dict) or ExifTags is None:
         return {}
 
@@ -175,9 +177,7 @@ def decode_gpsinfo_if_possible(gps_ifd: Any) -> Dict[str, Any]:
         if lon is not None and ref == "W":
             lon = -lon
 
-    out = {
-        "gps_raw": {k: to_jsonable(v) for k, v in gps_tags.items()}
-    }
+    out = {"gps_raw": {k: to_jsonable(v) for k, v in gps_tags.items()}}
     if lat is not None:
         out["latitude"] = lat
     if lon is not None:
@@ -186,10 +186,6 @@ def decode_gpsinfo_if_possible(gps_ifd: Any) -> Dict[str, Any]:
 
 
 def read_basic_exif_pillow(path: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    """
-    Απλό EXIF μέσω Pillow (περιορισμένο). Σε DJI thermal TIFF, πολλά vendor πράγματα
-    εμφανίζονται στο XMLPacket (XMP) και όχι ως κλασικά EXIF tags.
-    """
     if Image is None:
         return {}, "Pillow not available (pip install pillow)"
 
@@ -204,7 +200,6 @@ def read_basic_exif_pillow(path: str) -> Tuple[Dict[str, Any], Optional[str]]:
             name = ExifTags.TAGS.get(k, str(k)) if ExifTags else str(k)
             tag_map[name] = v
 
-        # GPS decoding only if GPSInfo is a dict; in your file it is often an offset number.
         if "GPSInfo" in tag_map and isinstance(tag_map["GPSInfo"], dict):
             tag_map["GPSDecoded"] = decode_gpsinfo_if_possible(tag_map["GPSInfo"])
 
@@ -218,12 +213,9 @@ def read_basic_exif_pillow(path: str) -> Tuple[Dict[str, Any], Optional[str]]:
 # -----------------------------
 
 def _try_extract_xml_fragment(text: str) -> Optional[str]:
-    """
-    Find <x:xmpmeta ...> ... </x:xmpmeta> fragment.
-    """
     start = text.find("<x:xmpmeta")
     if start == -1:
-        start = text.find("<xmpmeta")  # sometimes without prefix
+        start = text.find("<xmpmeta")
     if start == -1:
         return None
 
@@ -239,16 +231,9 @@ def _try_extract_xml_fragment(text: str) -> Optional[str]:
 
 
 def _decode_xmlpacket_to_text(xmlpacket: Any) -> Optional[str]:
-    """
-    Pillow sometimes returns XMLPacket as:
-    - bytes (ideal)
-    - str with mojibake (as you saw)
-    We try multiple decode/repair approaches.
-    """
     if xmlpacket is None:
         return None
 
-    # If bytes: try decode as UTF-8 / UTF-16LE / UTF-16BE
     if isinstance(xmlpacket, (bytes, bytearray)):
         b = bytes(xmlpacket)
         for enc in ("utf-8", "utf-16le", "utf-16be", "latin-1"):
@@ -261,9 +246,7 @@ def _decode_xmlpacket_to_text(xmlpacket: Any) -> Optional[str]:
                 continue
         return None
 
-    # If str: attempt to "recover" to bytes and decode as utf-16le (common for XMP in TIFF)
     if isinstance(xmlpacket, str):
-        # Approach 1: latin-1 encode to preserve byte values 0-255 then decode as utf-16le
         try:
             raw = xmlpacket.encode("latin-1", errors="ignore")
             for enc in ("utf-16le", "utf-16be", "utf-8"):
@@ -274,7 +257,6 @@ def _decode_xmlpacket_to_text(xmlpacket: Any) -> Optional[str]:
         except Exception:
             pass
 
-        # Approach 2: direct search in the string (maybe already contains readable XML)
         frag = _try_extract_xml_fragment(xmlpacket)
         if frag:
             return frag
@@ -283,34 +265,20 @@ def _decode_xmlpacket_to_text(xmlpacket: Any) -> Optional[str]:
 
 
 def parse_dji_xmp_from_xmlpacket(xmlpacket: Any) -> Dict[str, Any]:
-    """
-    Parse DJI-related tags from XMP packet.
-
-    Returns:
-      {
-        "namespaces": {...},
-        "tags": {"drone-dji:AbsoluteAltitude": "...", ...},
-        "dji_simple": {"AbsoluteAltitude": "...", ...},
-        "gps_from_xmp": {"latitude": ..., "longitude": ...} if found
-      }
-    """
     xml_text = _decode_xmlpacket_to_text(xmlpacket)
     if not xml_text:
         return {}
 
-    # xml.etree requires valid XML; sometimes there are control chars; strip them lightly.
-    cleaned = "".join(ch for ch in xml_text if ch == "\n" or ch == "\t" or (ord(ch) >= 32))
+    cleaned = "".join(ch for ch in xml_text if ch in ("\n", "\t") or (ord(ch) >= 32))
     try:
         root = ET.fromstring(cleaned)
     except Exception:
-        # Try one more time with a looser cleanup
         cleaned2 = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u0080-\uFFFF]", "", xml_text)
         try:
             root = ET.fromstring(cleaned2)
         except Exception:
             return {}
 
-    # Collect namespaces from the root string (quick heuristic)
     ns = {}
     for m in re.finditer(r'xmlns:([A-Za-z0-9_\-]+)="([^"]+)"', cleaned):
         ns[m.group(1)] = m.group(2)
@@ -318,21 +286,17 @@ def parse_dji_xmp_from_xmlpacket(xmlpacket: Any) -> Dict[str, Any]:
     tags: Dict[str, Any] = {}
     dji_simple: Dict[str, Any] = {}
 
-    # Iterate all elements and record those that contain 'drone-dji' in tag namespace URI or prefix
     for elem in root.iter():
-        tag = elem.tag  # can be '{uri}local' or 'prefix:local' depending on parser
+        tag = elem.tag
         text = (elem.text or "").strip() if elem.text else ""
 
-        # Case A: {uri}local
         if tag.startswith("{"):
             uri, local = tag[1:].split("}", 1)
-            # match uri that looks like DJI
             if "dji" in uri.lower() and ("drone" in uri.lower() or "dji.com" in uri.lower()):
                 key = f"{{{uri}}}{local}"
                 tags[key] = text
                 dji_simple[local] = text
 
-        # Case B: prefix:local
         if ":" in tag and not tag.startswith("{"):
             prefix, local = tag.split(":", 1)
             if prefix.lower() in ("drone-dji", "dji", "djidrone", "dronedji"):
@@ -340,35 +304,8 @@ def parse_dji_xmp_from_xmlpacket(xmlpacket: Any) -> Dict[str, Any]:
                 tags[key] = text
                 dji_simple[local] = text
 
-    # Try to infer GPS from XMP (common names: RtkStdLat/RtkStdLon, Latitude/Longitude, etc.)
-    gps_from_xmp = {}
-    # check a bunch of likely keys
-    lat_candidates = ["Latitude", "lat", "RtkStdLat", "GpsLatitude", "GPSLatitude", "RTKStdLat"]
-    lon_candidates = ["Longitude", "lon", "RtkStdLon", "GpsLongitude", "GPSLongitude", "RTKStdLon"]
-
-    def _find_first_float(keys: List[str]) -> Optional[float]:
-        for k in keys:
-            if k in dji_simple:
-                try:
-                    return float(str(dji_simple[k]).strip())
-                except Exception:
-                    continue
-        return None
-
-    lat = _find_first_float(lat_candidates)
-    lon = _find_first_float(lon_candidates)
-    if lat is not None:
-        gps_from_xmp["latitude"] = lat
-    if lon is not None:
-        gps_from_xmp["longitude"] = lon
-
-    out = {
-        "namespaces": ns,
-        "tags": tags,
-        "dji_simple": dji_simple,
-    }
-    if gps_from_xmp:
-        out["gps_from_xmp"] = gps_from_xmp
+    # IMPORTANT: DO NOT infer GPS from RtkStdLat/Lon (they are std-dev)
+    out = {"namespaces": ns, "tags": tags, "dji_simple": dji_simple}
     return out
 
 
@@ -382,12 +319,7 @@ def read_tiff_pixels(path: str) -> Tuple[Dict[str, Any], Optional[str]]:
     try:
         arr = tifffile.imread(path)
 
-        info: Dict[str, Any] = {
-            "shape": list(arr.shape),
-            "dtype": str(arr.dtype),
-            "ndim": int(arr.ndim),
-        }
-
+        info: Dict[str, Any] = {"shape": list(arr.shape), "dtype": str(arr.dtype), "ndim": int(arr.ndim)}
         a = arr.astype(np.float64)
 
         if arr.ndim == 2:
@@ -413,7 +345,7 @@ def read_tiff_pixels(path: str) -> Tuple[Dict[str, Any], Optional[str]]:
 
 
 # -----------------------------
-# Report-like extraction
+# Helpers for picking keys + parsing lat/lon robustly
 # -----------------------------
 
 def normalize_key(k: str) -> str:
@@ -442,47 +374,258 @@ def find_matching_keys(meta: Dict[str, Any], patterns: List[str]) -> Dict[str, A
     return out
 
 
+def parse_latlon_value(v: Any) -> Optional[float]:
+    """
+    Parse lat/lon from:
+    - float/int
+    - "37.12345"
+    - "37,12345"
+    - "40 deg 22' 51.17\" N"
+    - "21 deg 47' 45.78\" E"
+    - "40 22 51.17 N"
+    """
+    if v is None:
+        return None
+
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return float(v)
+
+    s = str(v).strip()
+    if not s:
+        return None
+
+    s_up = s.upper()
+    s_norm = s.replace(",", ".").strip()
+
+    # try simple float first
+    try:
+        return float(s_norm)
+    except Exception:
+        pass
+
+    hemi = None
+    for h in ("N", "S", "E", "W"):
+        if h in s_up:
+            hemi = h
+            break
+
+    nums = re.findall(r"[-+]?\d+(?:\.\d+)?", s_norm)
+    if not nums:
+        return None
+
+    try:
+        if len(nums) >= 3:
+            deg = float(nums[0])
+            minutes = float(nums[1])
+            sec = float(nums[2])
+            val = abs(deg) + minutes / 60.0 + sec / 3600.0
+            if str(nums[0]).startswith("-"):
+                val = -val
+        else:
+            val = float(nums[0])
+    except Exception:
+        return None
+
+    if hemi in ("S", "W"):
+        val = -abs(val)
+    elif hemi in ("N", "E"):
+        val = abs(val)
+
+    return val
+
+
+def valid_latlon(lat: Optional[float], lon: Optional[float]) -> bool:
+    if lat is None or lon is None:
+        return False
+    return (-90.0 <= lat <= 90.0) and (-180.0 <= lon <= 180.0)
+
+
+# -----------------------------
+# Summary
+# -----------------------------
+
 def build_summary(meta: Dict[str, Any], dji_simple: Dict[str, Any]) -> Dict[str, Any]:
     s = {}
-    s["Make"] = pick_first(meta, ["EXIF:Make", "Make"])
-    s["Model"] = pick_first(meta, ["EXIF:Model", "Model"])
-    s["CameraSerialNumber"] = pick_first(meta, ["EXIF:CameraSerialNumber", "CameraSerialNumber", "SerialNumber", "BodySerialNumber"])
-    s["FocalLength"] = pick_first(meta, ["EXIF:FocalLength", "FocalLength", "Focal Length"])
-    s["FNumber"] = pick_first(meta, ["EXIF:FNumber", "FNumber", "F-Number", "F Number"])
-    s["ImageWidth"] = pick_first(meta, ["File:ImageWidth", "ImageWidth", "EXIF:ExifImageWidth"])
-    s["ImageHeight"] = pick_first(meta, ["File:ImageHeight", "ImageLength", "ImageHeight", "EXIF:ExifImageHeight"])
-    s["DateTimeOriginal"] = pick_first(meta, ["EXIF:DateTimeOriginal", "DateTimeOriginal", "Date/Time Original"])
-    s["DateTime"] = pick_first(meta, ["EXIF:DateTime", "DateTime", "Date Time"])
-    s["Software"] = pick_first(meta, ["Software", "EXIF:Software"])
-    s["ImageDescription"] = pick_first(meta, ["ImageDescription", "EXIF:ImageDescription"])
+    s["Make"] = pick_first(meta, ["EXIF:Make", "IFD0:Make", "Make"])
+    s["Model"] = pick_first(meta, ["EXIF:Model", "IFD0:Model", "Model"])
+    s["CameraSerialNumber"] = pick_first(meta, ["EXIF:CameraSerialNumber", "IFD0:CameraSerialNumber", "CameraSerialNumber"])
+    s["FocalLength"] = pick_first(meta, ["EXIF:FocalLength", "ExifIFD:FocalLength", "FocalLength"])
+    s["FNumber"] = pick_first(meta, ["EXIF:FNumber", "ExifIFD:FNumber", "FNumber"])
+    s["ImageWidth"] = pick_first(meta, ["File:ImageWidth", "IFD0:ImageWidth", "ImageWidth", "ExifIFD:ExifImageWidth"])
+    s["ImageHeight"] = pick_first(meta, ["File:ImageHeight", "IFD0:ImageHeight", "ImageLength", "ImageHeight", "ExifIFD:ExifImageHeight"])
+    s["DateTimeOriginal"] = pick_first(meta, ["EXIF:DateTimeOriginal", "ExifIFD:DateTimeOriginal", "DateTimeOriginal"])
+    s["DateTime"] = pick_first(meta, ["EXIF:DateTime", "IFD0:ModifyDate", "DateTime"])
+    s["Software"] = pick_first(meta, ["Software", "IFD0:Software", "EXIF:Software"])
+    s["ImageDescription"] = pick_first(meta, ["ImageDescription", "IFD0:ImageDescription", "EXIF:ImageDescription"])
 
-    # GPS: from Pillow-decoded GPS if available
-    gps_decoded = meta.get("GPSDecoded")
-    if isinstance(gps_decoded, dict):
-        s["Latitude"] = gps_decoded.get("latitude")
-        s["Longitude"] = gps_decoded.get("longitude")
+    # GPS (prefer exiftool composite)
+    lat = parse_latlon_value(pick_first(meta, ["Composite:GPSLatitude", "GPS:GPSLatitude", "EXIF:GPSLatitude", "GPSLatitude"]))
+    lon = parse_latlon_value(pick_first(meta, ["Composite:GPSLongitude", "GPS:GPSLongitude", "EXIF:GPSLongitude", "GPSLongitude"]))
+    if valid_latlon(lat, lon):
+        s["Latitude"] = lat
+        s["Longitude"] = lon
 
-    # GPS: from DJI XMP if found
-    if "Latitude" not in s or s["Latitude"] is None:
-        if "gps_from_xmp" in dji_simple:
-            # (not used here)
-            pass
-
-    # Likely DJI flight fields (nice to have)
-    for key in ("AbsoluteAltitude", "RelativeAltitude", "GimbalYawDegree", "GimbalPitchDegree", "GimbalRollDegree",
-                "FlightYawDegree", "FlightPitchDegree", "FlightRollDegree"):
+    for key in (
+        "AbsoluteAltitude", "RelativeAltitude",
+        "GimbalYawDegree", "GimbalPitchDegree", "GimbalRollDegree",
+        "FlightYawDegree", "FlightPitchDegree", "FlightRollDegree"
+    ):
         if key in dji_simple and dji_simple[key] not in (None, ""):
             s[f"DJI_{key}"] = dji_simple[key]
 
-    # thermal/measurement params (may or may not exist)
     s["Emissivity"] = pick_first(meta, ["Emissivity", "XMP:Emissivity", "EXIF:Emissivity"])
-    s["Distance"] = pick_first(meta, ["Distance", "SubjectDistance", "EXIF:SubjectDistance"])
+    s["Distance"] = pick_first(meta, ["Distance", "SubjectDistance", "EXIF:SubjectDistance", "ExifIFD:SubjectDistance"])
     s["AmbientTemperature"] = pick_first(meta, ["AmbientTemperature", "Ambient Temperature"])
     s["RelativeHumidity"] = pick_first(meta, ["RelativeHumidity", "Relative Humidity", "Humidity"])
     s["WindSpeed"] = pick_first(meta, ["WindSpeed", "Wind Speed"])
     s["Irradiance"] = pick_first(meta, ["Irradiance", "SolarIrradiance", "Solar Irradiance"])
 
     return s
+
+
+# -----------------------------
+# Categorization
+# -----------------------------
+
+def build_categories(combined: Dict[str, Any], dji_simple: Dict[str, Any], pixels_info: Dict[str, Any]) -> Dict[str, Any]:
+    def first(keys: List[str]) -> Optional[Any]:
+        return pick_first(combined, keys)
+
+    cats: Dict[str, Any] = {}
+
+    cats["image_info"] = {
+        "ImageWidth": first(["File:ImageWidth", "IFD0:ImageWidth", "ImageWidth", "ExifIFD:ExifImageWidth"]),
+        "ImageHeight": first(["File:ImageHeight", "IFD0:ImageHeight", "ImageLength", "ImageHeight", "ExifIFD:ExifImageHeight"]),
+        "BitsPerSample": first(["IFD0:BitsPerSample", "BitsPerSample", "XMP-tiff:BitsPerSample"]),
+        "Compression": first(["IFD0:Compression", "Compression", "XMP-tiff:Compression"]),
+        "PhotometricInterpretation": first(["IFD0:PhotometricInterpretation", "PhotometricInterpretation"]),
+        "PlanarConfiguration": first(["IFD0:PlanarConfiguration", "PlanarConfiguration"]),
+        "Software": first(["IFD0:Software", "Software"]),
+        "ImageDescription": first(["IFD0:ImageDescription", "ImageDescription"]),
+        "SampleFormat": first(["IFD0:SampleFormat", "SampleFormat"]),
+    }
+
+    cats["device"] = {
+        "Make": first(["IFD0:Make", "EXIF:Make", "Make"]),
+        "Model": first(["IFD0:Model", "EXIF:Model", "Model"]),
+        "SerialNumber": first(["ExifIFD:SerialNumber", "IFD0:CameraSerialNumber", "EXIF:CameraSerialNumber", "CameraSerialNumber"]),
+        "LensModel": first(["EXIF:LensModel", "LensModel"]),
+        "FocalLength": first(["ExifIFD:FocalLength", "EXIF:FocalLength", "FocalLength"]),
+        "FNumber": first(["ExifIFD:FNumber", "EXIF:FNumber", "FNumber"]),
+    }
+
+    cats["timestamps"] = {
+        "DateTimeOriginal": first(["ExifIFD:DateTimeOriginal", "EXIF:DateTimeOriginal", "DateTimeOriginal"]),
+        "CreateDate": first(["ExifIFD:CreateDate", "EXIF:CreateDate", "CreateDate"]),
+        "ModifyDate": first(["IFD0:ModifyDate", "EXIF:ModifyDate", "ModifyDate"]),
+        "DateTime": first(["EXIF:DateTime", "DateTime"]),
+        "GPSDateTime": first(["Composite:GPSDateTime", "XMP-exif:GPSDateTime", "GPS:GPSDateStamp"]),
+    }
+
+    # Geolocation: prefer exiftool composite / gps group
+    lat = parse_latlon_value(first(["Composite:GPSLatitude", "GPS:GPSLatitude", "EXIF:GPSLatitude", "GPSLatitude"]))
+    lon = parse_latlon_value(first(["Composite:GPSLongitude", "GPS:GPSLongitude", "EXIF:GPSLongitude", "GPSLongitude"]))
+
+    # fallback: Pillow decoded GPS (rare on DJI TIFF)
+    gps_decoded = combined.get("GPSDecoded")
+    if (not valid_latlon(lat, lon)) and isinstance(gps_decoded, dict):
+        lat2 = gps_decoded.get("latitude")
+        lon2 = gps_decoded.get("longitude")
+        if valid_latlon(lat2, lon2):
+            lat, lon = float(lat2), float(lon2)
+
+    # DO NOT use RtkStdLat/Lon as coords; only keep them as accuracy fields under flight
+    if not valid_latlon(lat, lon):
+        lat, lon = None, None
+
+    cats["geolocation"] = {
+        "latitude": lat,
+        "longitude": lon,
+        "altitude": first(["Composite:GPSAltitude", "GPS:GPSAltitude", "EXIF:GPSAltitude"]),
+        "gps_position": first(["Composite:GPSPosition"]),
+        "map_datum": first(["GPS:GPSMapDatum"]),
+    }
+
+    cats["flight"] = {
+        "AbsoluteAltitude": dji_simple.get("AbsoluteAltitude"),
+        "RelativeAltitude": dji_simple.get("RelativeAltitude"),
+        "FlightYawDegree": dji_simple.get("FlightYawDegree"),
+        "FlightPitchDegree": dji_simple.get("FlightPitchDegree"),
+        "FlightRollDegree": dji_simple.get("FlightRollDegree"),
+        "GimbalYawDegree": dji_simple.get("GimbalYawDegree"),
+        "GimbalPitchDegree": dji_simple.get("GimbalPitchDegree"),
+        "GimbalRollDegree": dji_simple.get("GimbalRollDegree"),
+        "FlightXSpeed": dji_simple.get("FlightXSpeed"),
+        "FlightYSpeed": dji_simple.get("FlightYSpeed"),
+        "FlightZSpeed": dji_simple.get("FlightZSpeed"),
+        "RtkFlag": dji_simple.get("RtkFlag"),
+        # keep RTK std-dev as accuracy (NOT coords)
+        "RtkStdLat": dji_simple.get("RtkStdLat"),
+        "RtkStdLon": dji_simple.get("RtkStdLon"),
+        "RtkStdHgt": dji_simple.get("RtkStdHgt"),
+    }
+
+    cats["measurement_params"] = {
+        "Emissivity": first(["Emissivity", "XMP:Emissivity", "EXIF:Emissivity"]),
+        "Distance": first(["Distance", "SubjectDistance", "EXIF:SubjectDistance", "ExifIFD:SubjectDistance"]),
+        "AmbientTemperature": first(["AmbientTemperature", "Ambient Temperature"]),
+        "RelativeHumidity": first(["RelativeHumidity", "Relative Humidity", "Humidity"]),
+        "WindSpeed": first(["WindSpeed", "Wind Speed"]),
+        "Irradiance": first(["Irradiance", "SolarIrradiance", "Solar Irradiance"]),
+    }
+
+    pixel_stats = None
+    if "raw_min" in pixels_info:
+        pixel_stats = {
+            "min": pixels_info.get("raw_min"),
+            "mean": pixels_info.get("raw_mean"),
+            "max": pixels_info.get("raw_max"),
+            "looks_like_celsius_guess": pixels_info.get("looks_like_celsius_guess"),
+        }
+
+    cats["measurement_temperatures"] = {"pixel_stats": pixel_stats}
+
+    cats["pixel_data"] = {
+        "shape": pixels_info.get("shape"),
+        "dtype": pixels_info.get("dtype"),
+        "ndim": pixels_info.get("ndim"),
+        "raw_min_all": pixels_info.get("raw_min_all"),
+        "raw_mean_all": pixels_info.get("raw_mean_all"),
+        "raw_max_all": pixels_info.get("raw_max_all"),
+        "radiometric_guess": pixels_info.get("radiometric_guess"),
+        "looks_like_celsius_guess": pixels_info.get("looks_like_celsius_guess"),
+    }
+
+    cats["dji_xmp_simple_all"] = dji_simple
+
+    def prune(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: prune(v) for k, v in obj.items() if v not in (None, "", {}, [])}
+        if isinstance(obj, list):
+            return [prune(v) for v in obj if v not in (None, "", {}, [])]
+        return obj
+
+    return prune(cats)
+
+
+# -----------------------------
+# Google Maps + QR
+# -----------------------------
+
+def google_maps_link(lat: float, lon: float) -> str:
+    return f"https://www.google.com/maps?q={lat:.7f},{lon:.7f}"
+
+
+def make_qr_png(link: str, out_png: str) -> Tuple[Optional[str], Optional[str]]:
+    if qrcode is None:
+        return None, "qrcode library not available (pip install qrcode[pil])"
+    try:
+        img = qrcode.make(link)
+        os.makedirs(os.path.dirname(out_png) or ".", exist_ok=True)
+        img.save(out_png)
+        return out_png, None
+    except Exception as e:
+        return None, f"QR generation failed: {e}"
 
 
 # -----------------------------
@@ -499,30 +642,29 @@ class ProbeResult:
     pillow_exif: Dict[str, Any]
     pixels_error: Optional[str]
     pixels_info: Dict[str, Any]
-    dji_xmp: Dict[str, Any]          # parsed output (namespaces/tags/dji_simple)
+    dji_xmp: Dict[str, Any]
     summary: Dict[str, Any]
     related_keys: Dict[str, Any]
+    categories: Dict[str, Any]
+    maps_link: Optional[str]
+    qr_png: Optional[str]
+    qr_error: Optional[str]
 
 
 def probe_tiff(path: str) -> ProbeResult:
-    # 1) ExifTool
     exiftool_meta, exiftool_err = run_exiftool_json(path)
     exiftool_available = which_exiftool() is not None
     if exiftool_meta is None:
         exiftool_meta = {}
 
-    # 2) Pillow
     pillow_exif, pillow_err = read_basic_exif_pillow(path)
 
-    # 3) DJI XMP from XMLPacket
     xml_packet = pillow_exif.get("XMLPacket")
     dji_xmp = parse_dji_xmp_from_xmlpacket(xml_packet) if xml_packet else {}
     dji_simple = dji_xmp.get("dji_simple", {}) if isinstance(dji_xmp, dict) else {}
 
-    # 4) Pixels
     pixels_info, pixels_err = read_tiff_pixels(path)
 
-    # Combine meta (priority to exiftool)
     combined = dict(pillow_exif)
     combined.update(exiftool_meta)
 
@@ -544,6 +686,8 @@ def probe_tiff(path: str) -> ProbeResult:
     ]
     related = find_matching_keys(combined, patterns)
 
+    categories = build_categories(combined, dji_simple, pixels_info)
+
     return ProbeResult(
         file=os.path.abspath(path),
         exiftool_available=exiftool_available,
@@ -556,6 +700,10 @@ def probe_tiff(path: str) -> ProbeResult:
         dji_xmp=dji_xmp,
         summary=summary,
         related_keys=related,
+        categories=categories,
+        maps_link=None,
+        qr_png=None,
+        qr_error=None,
     )
 
 
@@ -594,6 +742,12 @@ def print_report(r: ProbeResult) -> None:
         if v is not None and v != "":
             print(f"{k}: {to_jsonable(v)}")
 
+    print("\n--- Maps / QR ---")
+    print("Google Maps link:", r.maps_link)
+    print("QR PNG:", r.qr_png)
+    if r.qr_error:
+        print("QR note:", r.qr_error)
+
     print("\n--- DJI XMP (parsed from XMLPacket) ---")
     if not r.dji_xmp:
         print("(no DJI XMP parsed)")
@@ -601,12 +755,10 @@ def print_report(r: ProbeResult) -> None:
         dji_simple = r.dji_xmp.get("dji_simple", {})
         print(f"Namespaces found: {len(r.dji_xmp.get('namespaces', {}))}")
         print(f"DJI simple tags: {len(dji_simple)}")
-        # show a curated subset first
         preferred = [
             "AbsoluteAltitude", "RelativeAltitude",
             "GimbalYawDegree", "GimbalPitchDegree", "GimbalRollDegree",
             "FlightYawDegree", "FlightPitchDegree", "FlightRollDegree",
-            "RtkStdLat", "RtkStdLon", "Latitude", "Longitude",
         ]
         shown = set()
         for k in preferred:
@@ -614,7 +766,6 @@ def print_report(r: ProbeResult) -> None:
                 print(f"{k}: {dji_simple[k]}")
                 shown.add(k)
 
-        # then show the rest (limited)
         remaining = [(k, v) for k, v in dji_simple.items() if k not in shown]
         remaining.sort(key=lambda kv: kv[0].lower())
         max_more = 120
@@ -639,6 +790,11 @@ def print_report(r: ProbeResult) -> None:
         if len(items) > max_show:
             print(f"... ({len(items) - max_show} more keys not shown)")
 
+    print("\n--- Categories (grouped output) ---")
+    for cat, obj in r.categories.items():
+        print(f"\n[{cat}]")
+        print(json.dumps(to_jsonable(obj), ensure_ascii=False, indent=2))
+
     print("\n==========================================================\n")
 
 
@@ -655,13 +811,23 @@ def to_json_dict(r: ProbeResult) -> Dict[str, Any]:
         "dji_xmp": to_jsonable(r.dji_xmp),
         "summary": to_jsonable(r.summary),
         "related_keys": to_jsonable(r.related_keys),
+        "categories": to_jsonable(r.categories),
+        "maps_link": r.maps_link,
+        "qr_png": r.qr_png,
+        "qr_error": r.qr_error,
     }
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Probe a TIFF for EXIF/XMP/MakerNotes + DJI XMP + pixel stats")
+    ap = argparse.ArgumentParser(
+        description="Probe a TIFF for EXIF/XMP/MakerNotes + DJI XMP + pixel stats + categorized output + optional QR"
+    )
     ap.add_argument("tiff", help="Path to .tif/.tiff file")
     ap.add_argument("--out", help="Write full JSON report to this file (default: <tiff>.probe.json)", default=None)
+
+    ap.add_argument("--qr", action="store_true", help="Generate QR code PNG for Google Maps link (if GPS exists)")
+    ap.add_argument("--qr-out", default=None, help="Output path for QR PNG (default: <tiff>.maps.qr.png)")
+
     args = ap.parse_args()
 
     path = args.tiff
@@ -669,6 +835,36 @@ def main():
         raise SystemExit(f"File not found: {path}")
 
     r = probe_tiff(path)
+
+    # QR generation (optional)
+    if args.qr:
+        geo = r.categories.get("geolocation", {}) if isinstance(r.categories, dict) else {}
+        lat = geo.get("latitude")
+        lon = geo.get("longitude")
+
+        maps_link = None
+        qr_path = None
+        qr_err = None
+
+        try:
+            if lat is not None and lon is not None:
+                maps_link = google_maps_link(float(lat), float(lon))
+                qr_out = args.qr_out or (path + ".maps.qr.png")
+                qr_path, qr_err = make_qr_png(maps_link, qr_out)
+            else:
+                qr_err = "No valid latitude/longitude found; QR not generated."
+        except Exception as e:
+            qr_err = f"QR generation exception: {e}"
+
+        r.maps_link = maps_link
+        r.qr_png = qr_path
+        r.qr_error = qr_err
+
+        r.categories.setdefault("maps", {})
+        r.categories["maps"]["google_maps_link"] = maps_link
+        r.categories["maps"]["qr_png"] = qr_path
+        r.categories["maps"]["qr_error"] = qr_err
+
     print_report(r)
 
     out_path = args.out or (path + ".probe.json")
