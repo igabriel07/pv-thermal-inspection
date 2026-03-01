@@ -56,6 +56,16 @@ import {
   WORKSPACE_THERMAL_TEMPS_CSV_DIR,
 } from './features/workspace/constants'
 import { getParentDirPath, normalizePath } from './features/workspace/pathUtils'
+import type { FileSystemDirectoryHandle } from './features/workspace/fileSystemAccess'
+import {
+  buildTree,
+  ensureHandlePermission,
+  hasWritePermission,
+  readDirectoryEntries,
+  type FileEntry,
+  type TreeNode,
+} from './features/workspace/fileTree'
+import { clearStoredFolderHandle, getStoredFolderHandle, storeFolderHandle } from './features/workspace/storage'
 
 type DraftTextInputProps = {
   value: string
@@ -105,18 +115,6 @@ const DraftTextInput = ({ value, className, placeholder, onCommit }: DraftTextIn
   )
 }
 
-type TreeNode = {
-  name: string
-  path: string
-  type: 'folder' | 'file'
-  children?: TreeNode[]
-}
-
-type FileEntry = {
-  path: string
-  file: File
-}
-
 type DocxDraftItem = {
   id: string
   path: string
@@ -156,48 +154,6 @@ type ReportCustomChapter = {
   chapterTitle: string // required
   sections: ReportCustomChapterSection[]
 }
-
-type FileSystemHandlePermissionDescriptor = {
-  mode?: 'read' | 'readwrite'
-}
-
-type FileSystemPermissionState = 'granted' | 'denied' | 'prompt'
-
-interface FileSystemHandle {
-  kind: 'file' | 'directory'
-  name: string
-  queryPermission?: (descriptor?: FileSystemHandlePermissionDescriptor) => Promise<FileSystemPermissionState>
-  requestPermission?: (descriptor?: FileSystemHandlePermissionDescriptor) => Promise<FileSystemPermissionState>
-}
-
-interface FileSystemFileHandle extends FileSystemHandle {
-  kind: 'file'
-  getFile: () => Promise<File>
-  createWritable?: () => Promise<FileSystemWritableFileStream>
-}
-
-interface FileSystemDirectoryHandle extends FileSystemHandle {
-  kind: 'directory'
-  entries?: () => AsyncIterableIterator<[string, FileSystemHandle]>
-  getDirectoryHandle?: (name: string, options?: { create?: boolean }) => Promise<FileSystemDirectoryHandle>
-  getFileHandle?: (name: string, options?: { create?: boolean }) => Promise<FileSystemFileHandle>
-  removeEntry?: (name: string, options?: { recursive?: boolean }) => Promise<void>
-}
-
-interface FileSystemWritableFileStream {
-  write: (data: string | Blob | BufferSource) => Promise<void>
-  close: () => Promise<void>
-}
-
-declare global {
-  interface Window {
-    showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>
-  }
-}
-
-const STORAGE_DB = 'app-storage'
-const STORAGE_STORE = 'folder-handles'
-const STORAGE_KEY = 'last-folder'
 
 const FAULT_TYPE_OPTIONS: Array<{ id: number; label: string }> = [
   { id: 0, label: 'Multi ByPassed' },
@@ -1116,120 +1072,6 @@ function App() {
       cancelled = true
     }
   }, [fileMap, selectedPath])
-
-  const openStorage = (): Promise<IDBDatabase> =>
-    new Promise((resolve, reject) => {
-      const request = indexedDB.open(STORAGE_DB, 1)
-      request.onupgradeneeded = () => {
-        const db = request.result
-        if (!db.objectStoreNames.contains(STORAGE_STORE)) {
-          db.createObjectStore(STORAGE_STORE)
-        }
-      }
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-
-  const storeFolderHandle = async (handle: FileSystemDirectoryHandle) => {
-    const db = await openStorage()
-    const tx = db.transaction(STORAGE_STORE, 'readwrite')
-    tx.objectStore(STORAGE_STORE).put(handle, STORAGE_KEY)
-    await new Promise<void>((resolve, reject) => {
-      tx.oncomplete = () => resolve()
-      tx.onerror = () => reject(tx.error)
-      tx.onabort = () => reject(tx.error)
-    })
-  }
-
-  const clearStoredFolderHandle = async () => {
-    const db = await openStorage()
-    const tx = db.transaction(STORAGE_STORE, 'readwrite')
-    tx.objectStore(STORAGE_STORE).delete(STORAGE_KEY)
-    await new Promise<void>((resolve, reject) => {
-      tx.oncomplete = () => resolve()
-      tx.onerror = () => reject(tx.error)
-      tx.onabort = () => reject(tx.error)
-    })
-  }
-
-  const getStoredFolderHandle = async (): Promise<FileSystemDirectoryHandle | null> => {
-    const db = await openStorage()
-    const tx = db.transaction(STORAGE_STORE, 'readonly')
-    const request = tx.objectStore(STORAGE_STORE).get(STORAGE_KEY)
-    return new Promise((resolve) => {
-      request.onsuccess = () => resolve(request.result ?? null)
-      request.onerror = () => resolve(null)
-    })
-  }
-
-  const ensureHandlePermission = async (handle: FileSystemDirectoryHandle, mode: 'read' | 'readwrite'): Promise<boolean> => {
-    if (!handle.queryPermission || !handle.requestPermission) return true
-    const granted = await handle.queryPermission({ mode } as any)
-    if (granted === 'granted') return true
-    return (await handle.requestPermission({ mode } as any)) === 'granted'
-  }
-
-  const hasWritePermission = async (handle: FileSystemDirectoryHandle): Promise<boolean> => {
-    if (!handle.queryPermission) return true
-    try {
-      const state = await handle.queryPermission({ mode: 'readwrite' } as any)
-      return state === 'granted'
-    } catch {
-      return false
-    }
-  }
-
-  const readDirectoryEntries = async (handle: FileSystemDirectoryHandle): Promise<FileEntry[]> => {
-    const entries: FileEntry[] = []
-
-    const walk = async (dir: FileSystemDirectoryHandle, basePath: string) => {
-      if (!dir.entries) return
-      for await (const [name, entry] of dir.entries()) {
-        const nextPath = basePath ? `${basePath}/${name}` : name
-        if (entry.kind === 'file') {
-          const file = await (entry as FileSystemFileHandle).getFile()
-          entries.push({ path: nextPath, file })
-        } else if (entry.kind === 'directory') {
-          await walk(entry as FileSystemDirectoryHandle, nextPath)
-        }
-      }
-    }
-
-    await walk(handle, '')
-    return entries
-  }
-
-  const buildTree = (entries: FileEntry[]): TreeNode | null => {
-    if (entries.length === 0) return null
-    const root: TreeNode = { name: 'root', path: '', type: 'folder', children: [] }
-
-    for (const entry of entries) {
-      const relPath = entry.path
-      const parts = relPath.split('/').filter(Boolean)
-      let current = root
-
-      parts.forEach((part, index) => {
-        const isFile = index === parts.length - 1
-        const currentPath = parts.slice(0, index + 1).join('/')
-        if (!current.children) current.children = []
-        let node = current.children.find((child) => child.name === part)
-
-        if (!node) {
-          node = {
-            name: part,
-            path: currentPath,
-            type: isFile ? 'file' : 'folder',
-            children: isFile ? undefined : [],
-          }
-          current.children.push(node)
-        }
-
-        if (!isFile) current = node
-      })
-    }
-
-    return root
-  }
 
   const refreshFolderEntries = async (handle: FileSystemDirectoryHandle) => {
     const entries = await readDirectoryEntries(handle)
