@@ -1192,7 +1192,7 @@ body.theme-light .tree-item.file.active {
 }
 
 .explorer-pane.metadata-pane {
-  flex: 0 0 260px;
+  flex: 0 0 200px;
 }
 
 .metadata-panel {
@@ -1377,7 +1377,7 @@ body.theme-light .tree-item.file.active {
 
 .metadata-qr {
   width: 100%;
-  max-width: 240px;
+  max-width: 200px;
   height: auto;
   border-radius: 12px;
   background: #ffffff;
@@ -2220,6 +2220,12 @@ body.theme-dark .help-footnote {
   max-height: min(100%, 1229px);
 }
 
+/* View page: remove image "frame" (border/shadow) around the main preview */
+.view-preview .preview-image {
+  border: none;
+  box-shadow: none;
+}
+
 .image-viewport {
   position: relative;
   width: 100%;
@@ -2228,20 +2234,6 @@ body.theme-dark .help-footnote {
   display: flex;
   align-items: center;
   justify-content: center;
-}
-
-.image-viewport.rgb-max-frame::after {
-  content: '';
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: min(100%, 1536px);
-  height: min(100%, 1229px);
-  transform: translate(-50%, -50%);
-  pointer-events: none;
-  border: 2px solid rgba(56, 189, 248, 0.75);
-  box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.25);
-  border-radius: 10px;
 }
 
 .image-viewport.can-pan {

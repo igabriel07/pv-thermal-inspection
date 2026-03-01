@@ -119,6 +119,20 @@ type ReportEquipmentItem = {
   imagePreviewUrl: string | null
 }
 
+type ReportCustomChapterSection = {
+  id: string
+  title: string // optional
+  text: string // optional
+  imageFile: File | null // optional
+  imagePreviewUrl: string | null
+}
+
+type ReportCustomChapter = {
+  id: string
+  chapterTitle: string // required
+  sections: ReportCustomChapterSection[]
+}
+
 type FileSystemHandlePermissionDescriptor = {
   mode?: 'read' | 'readwrite'
 }
@@ -604,6 +618,10 @@ function App() {
   const [equipmentItems, setEquipmentItems] = useState<ReportEquipmentItem[]>([
     { id: `${Date.now()}-${Math.random().toString(16).slice(2)}` , title: '', text: '', imageFile: null, imagePreviewUrl: null },
   ])
+
+  type ReportLeftTabId = 'description' | 'equipment' | `chapter:${string}`
+  const [reportLeftTab, setReportLeftTab] = useState<ReportLeftTabId>('description')
+  const [reportChapters, setReportChapters] = useState<ReportCustomChapter[]>([])
   const [reportDraftWidth, setReportDraftWidth] = useState<number>(420)
   const [isReportDraftResizing, setIsReportDraftResizing] = useState(false)
   const [imageMetrics, setImageMetrics] = useState<{ width: number; height: number; naturalWidth: number; naturalHeight: number }>({
@@ -1576,6 +1594,9 @@ function App() {
   }
 
   const handleRemoveFolder = async () => {
+    const ok = window.confirm('Close the current folder and clear the session? (This will NOT delete any files on disk.)')
+    if (!ok) return
+
     setFileMap({})
     setFileTree(null)
     setExpandedPaths(new Set(['']))
@@ -3512,6 +3533,41 @@ function App() {
     )
   }
 
+  const updateDocxDraftRowDescriptionForAllImagesByTableTitleAndRowName = (tableTitle: string, rowName: string, description: string) => {
+    const titleKey = (tableTitle || '').trim().toLowerCase()
+    const rowKey = (rowName || '').trim().toLowerCase()
+    if (!titleKey || !rowKey) return
+
+    setDocxDraft((prev) =>
+      prev.map((item) => {
+        const tables = Array.isArray(item.tables) ? item.tables : []
+        if (!tables.length) return item
+
+        let anyChanged = false
+        const nextTables = tables.map((t) => {
+          if (((t?.title || '').trim().toLowerCase() !== titleKey)) return t
+
+          const rows = Array.isArray(t?.rows) ? t.rows : []
+          if (!rows.length) return t
+
+          let changedRows = false
+          const nextRows = rows.map((r) => {
+            if (((r?.name || '').trim().toLowerCase() !== rowKey)) return r
+            if (String(r?.description ?? '') === description) return r
+            changedRows = true
+            return { ...r, description }
+          })
+
+          if (!changedRows) return t
+          anyChanged = true
+          return { ...t, rows: nextRows }
+        })
+
+        return anyChanged ? { ...item, tables: nextTables } : item
+      })
+    )
+  }
+
   const removeDocxDraftTableRow = (draftId: string, tableId: string, rowId: string) => {
     const newId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`
     setDocxDraft((prev) =>
@@ -4088,10 +4144,25 @@ function App() {
     const BOOKMARK_DESCRIPTION = 'section_description'
     const BOOKMARK_EQUIPMENT = 'section_equipment'
     const BOOKMARK_REPORTS = 'section_reports'
+    const BOOKMARK_CUSTOM_PREFIX = 'section_custom_'
     const BOOKMARK_IMAGE_PREFIX = 'section_report_image_'
 
     // Used to avoid auto-rendering an RGB pair when that RGB image is already explicitly included.
     const includedPathSet = new Set(items.map((it) => it.path))
+
+    const cleanCustomChapters = reportChapters
+      .map((c) => ({
+        id: c.id,
+        chapterTitle: (c.chapterTitle || '').trim(),
+        sections: (Array.isArray(c.sections) ? c.sections : [])
+          .map((s) => ({
+            ...s,
+            title: (s.title || '').trim(),
+            text: (s.text || '').trim(),
+          }))
+          .filter((s) => s.title || s.text || s.imageFile),
+      }))
+      .filter((c) => c.chapterTitle)
 
     const sectionTitle = (title: string, bookmarkId: string) =>
       new Paragraph({
@@ -4110,7 +4181,7 @@ function App() {
 
     const descriptionPage = 2
     const equipmentPage = 3
-    const reportsPage = 4
+    const reportsPage = 4 + cleanCustomChapters.length
 
     const tocRightStop = Math.round(convertInchesToTwip(7.1))
     const tocTitleStop = Math.round(convertInchesToTwip(0.7))
@@ -4172,7 +4243,13 @@ function App() {
       }),
       tocLine(1, 'Description', BOOKMARK_DESCRIPTION, descriptionPage),
       tocLine(2, 'Equipment', BOOKMARK_EQUIPMENT, equipmentPage),
-      tocLine(3, 'Reports (anomaly detected)', BOOKMARK_REPORTS, reportsPage),
+      ...cleanCustomChapters.map((c, idx) => {
+        const page = 4 + idx
+        const chapterIndex = 3 + idx
+        const bookmarkId = `${BOOKMARK_CUSTOM_PREFIX}${c.id}`
+        return tocLine(chapterIndex, c.chapterTitle, bookmarkId, page)
+      }),
+      tocLine(3 + cleanCustomChapters.length, 'Reports (anomaly detected)', BOOKMARK_REPORTS, reportsPage),
       ...items.map((it, idx) => {
         const token = getTocImageToken(it.path) || (it.path.split('/').pop() || it.path)
         // Best-effort: assume 1 page per image item (tables may add extra pages).
@@ -4263,6 +4340,59 @@ function App() {
                 children: [new TextRun({ text: `Unsupported equipment image: ${item.imageFile.type || 'unknown type'}`, color: 'B91C1C' })],
               })
             )
+          }
+        }
+      }
+    }
+
+    // Custom user chapters (each on its own page).
+    for (const chapter of cleanCustomChapters) {
+      children.push(new Paragraph({ children: [new PageBreak()] }))
+      children.push(sectionTitle(chapter.chapterTitle, `${BOOKMARK_CUSTOM_PREFIX}${chapter.id}`))
+
+      if (!chapter.sections.length) {
+        children.push(new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: '' })] }))
+      } else {
+        for (const section of chapter.sections) {
+          if (section.title) {
+            children.push(
+              new Paragraph({
+                alignment: AlignmentType.CENTER,
+                spacing: { before: 120, after: 80 },
+                children: [new TextRun({ text: section.title, bold: true, size: 24 })],
+              })
+            )
+          }
+
+          if (section.text) {
+            children.push(
+              new Paragraph({
+                alignment: AlignmentType.CENTER,
+                spacing: { before: 0, after: 120 },
+                children: paragraphRunsFromMultiline(section.text),
+              })
+            )
+          }
+
+          if (section.imageFile) {
+            const run = await fileToImageRun(section.imageFile, 520, 420)
+            if (run) {
+              children.push(
+                new Paragraph({
+                  alignment: AlignmentType.CENTER,
+                  spacing: { before: 0, after: 240 },
+                  children: [run],
+                })
+              )
+            } else {
+              children.push(
+                new Paragraph({
+                  alignment: AlignmentType.CENTER,
+                  spacing: { before: 0, after: 240 },
+                  children: [new TextRun({ text: `Unsupported chapter image: ${section.imageFile.type || 'unknown type'}`, color: 'B91C1C' })],
+                })
+              )
+            }
           }
         }
       }
@@ -5015,6 +5145,15 @@ function App() {
     setDocxPreviewError('')
     setDocxPreviewStatus('Building preview…')
 
+    const missingChapterTitles = reportChapters.filter((c) => !(c.chapterTitle || '').trim()).length
+    if (missingChapterTitles > 0) {
+      const msg = 'Please set a title for each added chapter.'
+      docxPreviewLastErrorRef.current = msg
+      setDocxPreviewError(msg)
+      setDocxPreviewStatus('')
+      return null
+    }
+
     const host = docxPreviewHostRef.current
     if (!host) {
       const msg = 'Preview host is not available.'
@@ -5095,6 +5234,13 @@ function App() {
     setReportError('')
     setReportStatus('Generating Word report…')
 
+    const missingChapterTitles = reportChapters.filter((c) => !(c.chapterTitle || '').trim()).length
+    if (missingChapterTitles > 0) {
+      setReportError('Please set a title for each added chapter.')
+      setReportStatus('')
+      return
+    }
+
     try {
       const draftToUse = docxDraft.length ? docxDraft : buildDocxDraftFromPaths(normalizeFaultsText(reportText || faultsList.join('\n')), [])
       const includedCount = draftToUse.filter((d) => d.include).length
@@ -5131,6 +5277,13 @@ function App() {
 
     setReportError('')
     setReportStatus('Generating PDF…')
+
+    const missingChapterTitles = reportChapters.filter((c) => !(c.chapterTitle || '').trim()).length
+    if (missingChapterTitles > 0) {
+      setReportError('Please set a title for each added chapter.')
+      setReportStatus('')
+      return
+    }
 
     try {
       const pdfBlob = await previewWordReport()
@@ -5216,6 +5369,80 @@ function App() {
     }
     const preview = await readFileAsDataUrl(file)
     updateEquipmentItem(id, { imageFile: file, imagePreviewUrl: preview })
+  }
+
+  const addReportChapter = () => {
+    const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+    const sectionId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+    setReportChapters((prev) => [
+      ...prev,
+      {
+        id,
+        chapterTitle: '',
+        sections: [{ id: sectionId, title: '', text: '', imageFile: null, imagePreviewUrl: null }],
+      },
+    ])
+    setReportLeftTab(`chapter:${id}`)
+  }
+
+  const removeReportChapter = (id: string) => {
+    const chapter = reportChapters.find((c) => c.id === id)
+    const label = (chapter?.chapterTitle || '').trim() || 'this chapter'
+    const ok = window.confirm(`Delete “${label}”?`)
+    if (!ok) return
+
+    setReportChapters((prev) => prev.filter((c) => c.id !== id))
+    setReportLeftTab((prev) => (prev === `chapter:${id}` ? 'description' : prev))
+  }
+
+  const updateReportChapter = (id: string, patch: Partial<ReportCustomChapter>) => {
+    setReportChapters((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)))
+  }
+
+  const addReportChapterSection = (chapterId: string) => {
+    const sectionId = `${Date.now()}-${Math.random().toString(16).slice(2)}`
+    setReportChapters((prev) =>
+      prev.map((c) =>
+        c.id !== chapterId
+          ? c
+          : {
+              ...c,
+              sections: [...(Array.isArray(c.sections) ? c.sections : []), { id: sectionId, title: '', text: '', imageFile: null, imagePreviewUrl: null }],
+            }
+      )
+    )
+  }
+
+  const removeReportChapterSection = (chapterId: string, sectionId: string) => {
+    const ok = window.confirm('Delete this subchapter?')
+    if (!ok) return
+
+    setReportChapters((prev) =>
+      prev.map((c) => {
+        if (c.id !== chapterId) return c
+        const nextSections = (Array.isArray(c.sections) ? c.sections : []).filter((s) => s.id !== sectionId)
+        return { ...c, sections: nextSections.length ? nextSections : [{ id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, title: '', text: '', imageFile: null, imagePreviewUrl: null }] }
+      })
+    )
+  }
+
+  const updateReportChapterSection = (chapterId: string, sectionId: string, patch: Partial<ReportCustomChapterSection>) => {
+    setReportChapters((prev) =>
+      prev.map((c) => {
+        if (c.id !== chapterId) return c
+        const nextSections = (Array.isArray(c.sections) ? c.sections : []).map((s) => (s.id === sectionId ? { ...s, ...patch } : s))
+        return { ...c, sections: nextSections }
+      })
+    )
+  }
+
+  const setReportChapterSectionImage = async (chapterId: string, sectionId: string, file: File | null) => {
+    if (!file) {
+      updateReportChapterSection(chapterId, sectionId, { imageFile: null, imagePreviewUrl: null })
+      return
+    }
+    const preview = await readFileAsDataUrl(file)
+    updateReportChapterSection(chapterId, sectionId, { imageFile: file, imagePreviewUrl: preview })
   }
 
   const readLabelsForPath = async (path: string) => {
@@ -9069,117 +9296,289 @@ function App() {
                   <div ref={reportSplitRef} className="report-split">
                     <div className="report-left">
                       <div className="report-left-window report-left-window-combined">
-                        <div className="report-left-section">
-                          <div className="report-sidebar-title explorer-pane-title">Description</div>
-                          <div className="report-sidebar-subtitle">Add one or more description blocks (included in the DOCX)</div>
+                        <div className="help-tabs" style={{ marginBottom: 10, flexWrap: 'wrap' }}>
+                          <button
+                            className={`link-button help-lang-button ${reportLeftTab === 'description' ? 'active' : ''}`}
+                            onClick={() => setReportLeftTab('description')}
+                          >
+                            Description
+                          </button>
+                          <button
+                            className={`link-button help-lang-button ${reportLeftTab === 'equipment' ? 'active' : ''}`}
+                            onClick={() => setReportLeftTab('equipment')}
+                          >
+                            Equipment
+                          </button>
 
-                          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
-                            <button className="link-button" onClick={() => addDescriptionRow()}>
-                              + Add description
-                            </button>
-                            <div className="docx-draft-meta">{descriptionRows.length} row(s)</div>
-                          </div>
+                          {reportChapters.map((c, idx) => {
+                            const id = `chapter:${c.id}` as const
+                            const label = (c.chapterTitle || '').trim() || `New ${idx + 1}`
+                            return (
+                              <span key={c.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                <button
+                                  className={`link-button help-lang-button ${reportLeftTab === id ? 'active' : ''}`}
+                                  onClick={() => setReportLeftTab(id)}
+                                  title={label}
+                                  type="button"
+                                >
+                                  {label}
+                                </button>
+                                <button
+                                  className="tiny-button danger"
+                                  onClick={() => removeReportChapter(c.id)}
+                                  title="Delete tab/chapter"
+                                  type="button"
+                                >
+                                  ✕
+                                </button>
+                              </span>
+                            )
+                          })}
 
-                          <div className="description-rows">
-                            {descriptionRows.map((row, idx) => (
-                              <div key={row.id} className="description-row">
-                                <div className="description-row-header">
-                                  <div className="description-row-title">{idx + 1}.</div>
-                                  <button className="tiny-button danger" onClick={() => removeDescriptionRow(row.id)} title="Remove">
-                                    ✕
-                                  </button>
-                                </div>
-
-                                <label className="description-label">
-                                  Title
-                                  <input
-                                    className="description-input"
-                                    value={row.title}
-                                    onChange={(e) => updateDescriptionRow(row.id, { title: e.target.value })}
-                                    placeholder="e.g. Site / Project / Summary"
-                                  />
-                                </label>
-
-                                <label className="description-label">
-                                  Text
-                                  <textarea
-                                    className="description-textarea"
-                                    value={row.text}
-                                    onChange={(e) => updateDescriptionRow(row.id, { text: e.target.value })}
-                                    placeholder="Write the description…"
-                                    rows={5}
-                                  />
-                                </label>
-                              </div>
-                            ))}
-                          </div>
+                          <button className="link-button help-lang-button" onClick={() => addReportChapter()} title="Add a new chapter">
+                            Add
+                          </button>
                         </div>
 
-                        <div className="report-left-section">
-                          <div className="report-sidebar-title explorer-pane-title">Equipment</div>
-                          <div className="report-sidebar-subtitle">Add equipment entries (title, description, optional image) (included in the DOCX)</div>
+                        {reportLeftTab === 'description' ? (
+                          <div className="report-left-section">
+                            <div className="report-sidebar-title explorer-pane-title">Description</div>
+                            <div className="report-sidebar-subtitle">Add one or more description blocks (included in the DOCX)</div>
 
-                          <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
-                            <button className="link-button" onClick={() => addEquipmentItem()}>
-                              + Add equipment
-                            </button>
-                            <div className="docx-draft-meta">{equipmentItems.length} item(s)</div>
-                          </div>
+                            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
+                              <button className="link-button" onClick={() => addDescriptionRow()}>
+                                + Add description
+                              </button>
+                              <div className="docx-draft-meta">{descriptionRows.length} row(s)</div>
+                            </div>
 
-                          <div className="equipment-rows">
-                            {equipmentItems.map((item, idx) => (
-                              <div key={item.id} className="equipment-row">
-                                <div className="equipment-row-top">
-                                  <input
-                                    className="equipment-row-title"
-                                    value={item.title}
-                                    onChange={(e) => updateEquipmentItem(item.id, { title: e.target.value })}
-                                    placeholder={`Equipment ${idx + 1} title`}
-                                  />
-                                  <button
-                                    className="tiny-button danger"
-                                    onClick={() => removeEquipmentItem(item.id)}
-                                    title="Remove"
-                                  >
-                                    ✕
-                                  </button>
+                            <div className="description-rows">
+                              {descriptionRows.map((row, idx) => (
+                                <div key={row.id} className="description-row">
+                                  <div className="description-row-header">
+                                    <div className="description-row-title">{idx + 1}.</div>
+                                    <button
+                                      className="tiny-button danger"
+                                      onClick={() => {
+                                        const ok = window.confirm('Delete this description block?')
+                                        if (!ok) return
+                                        removeDescriptionRow(row.id)
+                                      }}
+                                      title="Remove"
+                                      type="button"
+                                    >
+                                      ✕
+                                    </button>
+                                  </div>
+
+                                  <label className="description-label">
+                                    Title
+                                    <input
+                                      className="description-input"
+                                      value={row.title}
+                                      onChange={(e) => updateDescriptionRow(row.id, { title: e.target.value })}
+                                      placeholder="e.g. Site / Project / Summary"
+                                    />
+                                  </label>
+
+                                  <label className="description-label">
+                                    Text
+                                    <textarea
+                                      className="description-textarea"
+                                      value={row.text}
+                                      onChange={(e) => updateDescriptionRow(row.id, { text: e.target.value })}
+                                      placeholder="Write the description…"
+                                      rows={5}
+                                    />
+                                  </label>
                                 </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
 
-                                <textarea
-                                  className="equipment-row-text"
-                                  value={item.text}
-                                  onChange={(e) => updateEquipmentItem(item.id, { text: e.target.value })}
-                                  placeholder="Equipment description…"
-                                  rows={4}
-                                />
+                        {reportLeftTab === 'equipment' ? (
+                          <div className="report-left-section">
+                            <div className="report-sidebar-title explorer-pane-title">Equipment</div>
+                            <div className="report-sidebar-subtitle">Add equipment entries (title, description, optional image) (included in the DOCX)</div>
 
-                                <div className="equipment-row-image">
-                                  <input
-                                    className="equipment-row-file"
-                                    type="file"
-                                    accept="image/*"
-                                    onChange={(e) => {
-                                      const f = e.target.files?.[0] || null
-                                      void setEquipmentItemImage(item.id, f)
-                                    }}
+                            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
+                              <button className="link-button" onClick={() => addEquipmentItem()}>
+                                + Add equipment
+                              </button>
+                              <div className="docx-draft-meta">{equipmentItems.length} item(s)</div>
+                            </div>
+
+                            <div className="equipment-rows">
+                              {equipmentItems.map((item, idx) => (
+                                <div key={item.id} className="equipment-row">
+                                  <div className="equipment-row-top">
+                                    <input
+                                      className="equipment-row-title"
+                                      value={item.title}
+                                      onChange={(e) => updateEquipmentItem(item.id, { title: e.target.value })}
+                                      placeholder={`Equipment ${idx + 1} title`}
+                                    />
+                                    <button
+                                      className="tiny-button danger"
+                                      onClick={() => {
+                                        const ok = window.confirm('Delete this equipment item?')
+                                        if (!ok) return
+                                        removeEquipmentItem(item.id)
+                                      }}
+                                      title="Remove"
+                                      type="button"
+                                    >
+                                      ✕
+                                    </button>
+                                  </div>
+
+                                  <textarea
+                                    className="equipment-row-text"
+                                    value={item.text}
+                                    onChange={(e) => updateEquipmentItem(item.id, { text: e.target.value })}
+                                    placeholder="Equipment description…"
+                                    rows={4}
                                   />
-                                  {item.imagePreviewUrl ? (
-                                    <div className="equipment-row-image-preview">
-                                      <img src={item.imagePreviewUrl} alt="equipment" />
+
+                                  <div className="equipment-row-image">
+                                    <input
+                                      className="equipment-row-file"
+                                      type="file"
+                                      accept="image/*"
+                                      onChange={(e) => {
+                                        const f = e.target.files?.[0] || null
+                                        void setEquipmentItemImage(item.id, f)
+                                      }}
+                                    />
+                                    {item.imagePreviewUrl ? (
+                                      <div className="equipment-row-image-preview">
+                                        <img src={item.imagePreviewUrl} alt="equipment" />
+                                        <button
+                                          className="equipment-row-clear-image"
+                                          onClick={() => {
+                                            const ok = window.confirm('Remove this image?')
+                                            if (!ok) return
+                                            void setEquipmentItemImage(item.id, null)
+                                          }}
+                                          title="Remove image"
+                                          type="button"
+                                        >
+                                          Remove image
+                                        </button>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+
+                        {reportLeftTab.startsWith('chapter:') ? (() => {
+                          const chapterId = reportLeftTab.slice('chapter:'.length)
+                          const chapter = reportChapters.find((c) => c.id === chapterId) || null
+                          if (!chapter) return null
+
+                          const missingTitle = !(chapter.chapterTitle || '').trim()
+                          return (
+                            <div className="report-left-section">
+                              <div className="report-sidebar-title explorer-pane-title">Chapter</div>
+                              <div className="report-sidebar-subtitle">This becomes a new chapter in the PDF. Image is auto-scaled to fit.</div>
+
+                              {missingTitle ? (
+                                <div className="report-error" style={{ marginBottom: 10 }}>
+                                  Chapter/Tab title is required.
+                                </div>
+                              ) : null}
+
+                              <label className="description-label">
+                                Chapter / Tab title (required)
+                                <input
+                                  className="description-input"
+                                  value={chapter.chapterTitle}
+                                  onChange={(e) => updateReportChapter(chapter.id, { chapterTitle: e.target.value })}
+                                  placeholder="e.g. Findings / Notes / Appendix"
+                                />
+                              </label>
+
+                              <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
+                                <button className="link-button" onClick={() => addReportChapterSection(chapter.id)} type="button">
+                                  + Add subchapter
+                                </button>
+                                <div className="docx-draft-meta">{(chapter.sections || []).length} block(s)</div>
+                              </div>
+
+                              <div className="description-rows">
+                                {(chapter.sections || []).map((section, idx) => (
+                                  <div key={section.id} className="description-row">
+                                    <div className="description-row-header">
+                                      <div className="description-row-title">{idx + 1}.</div>
                                       <button
-                                        className="equipment-row-clear-image"
-                                        onClick={() => void setEquipmentItemImage(item.id, null)}
-                                        title="Remove image"
+                                        className="tiny-button danger"
+                                        onClick={() => removeReportChapterSection(chapter.id, section.id)}
+                                        title="Remove"
+                                        type="button"
                                       >
-                                        Remove image
+                                        ✕
                                       </button>
                                     </div>
-                                  ) : null}
-                                </div>
+
+                                    <label className="description-label">
+                                      Title (optional)
+                                      <input
+                                        className="description-input"
+                                        value={section.title}
+                                        onChange={(e) => updateReportChapterSection(chapter.id, section.id, { title: e.target.value })}
+                                        placeholder="Optional title shown inside the PDF"
+                                      />
+                                    </label>
+
+                                    <label className="description-label">
+                                      Text (optional)
+                                      <textarea
+                                        className="description-textarea"
+                                        value={section.text}
+                                        onChange={(e) => updateReportChapterSection(chapter.id, section.id, { text: e.target.value })}
+                                        placeholder="Optional text…"
+                                        rows={6}
+                                      />
+                                    </label>
+
+                                    <div className="equipment-row-image">
+                                      <input
+                                        className="equipment-row-file"
+                                        type="file"
+                                        accept="image/*"
+                                        onChange={(e) => {
+                                          const f = e.target.files?.[0] || null
+                                          void setReportChapterSectionImage(chapter.id, section.id, f)
+                                        }}
+                                      />
+                                      {section.imagePreviewUrl ? (
+                                        <div className="equipment-row-image-preview">
+                                          <img src={section.imagePreviewUrl} alt="subchapter" />
+                                          <button
+                                            className="equipment-row-clear-image"
+                                            onClick={() => {
+                                              const ok = window.confirm('Remove this image?')
+                                              if (!ok) return
+                                              void setReportChapterSectionImage(chapter.id, section.id, null)
+                                            }}
+                                            title="Remove image"
+                                            type="button"
+                                          >
+                                            Remove image
+                                          </button>
+                                        </div>
+                                      ) : null}
+                                    </div>
+                                  </div>
+                                ))}
                               </div>
-                            ))}
-                          </div>
-                        </div>
+                            </div>
+                          )
+                        })() : null}
                       </div>
                     </div>
 
@@ -9244,7 +9643,16 @@ function App() {
                                     >
                                       ↓
                                     </button>
-                                    <button className="tiny-button danger" onClick={() => removeDocxDraftItem(item.id)}>
+                                    <button
+                                      className="tiny-button danger"
+                                      onClick={() => {
+                                        const label = fileStemFromPath(item.path)
+                                        const ok = window.confirm(`Remove “${label}” from the DOCX draft?`)
+                                        if (!ok) return
+                                        removeDocxDraftItem(item.id)
+                                      }}
+                                      type="button"
+                                    >
                                       Remove
                                     </button>
                                   </div>
@@ -9276,7 +9684,11 @@ function App() {
                                             </div>
                                             <button
                                               className="tiny-button danger"
-                                              onClick={() => removeDocxDraftTable(item.id, table.id)}
+                                              onClick={() => {
+                                                const ok = window.confirm('Remove this table?')
+                                                if (!ok) return
+                                                removeDocxDraftTable(item.id, table.id)
+                                              }}
                                               type="button"
                                               title="Remove table"
                                             >
@@ -9295,12 +9707,27 @@ function App() {
                                               <DraftTextInput
                                                 className="docx-field-input docx-kv-input"
                                                 value={row.description}
-                                                onCommit={(next) => updateDocxDraftTableRow(item.id, table.id, row.id, { description: next })}
+                                                onCommit={(next) => {
+                                                  const isDistance =
+                                                    (table.title || '').trim().toLowerCase() === 'thermal parameters' &&
+                                                    (row.name || '').trim().toLowerCase() === 'distance'
+
+                                                  if (isDistance) {
+                                                    updateDocxDraftRowDescriptionForAllImagesByTableTitleAndRowName('Thermal parameters', 'Distance', next)
+                                                    return
+                                                  }
+
+                                                  updateDocxDraftTableRow(item.id, table.id, row.id, { description: next })
+                                                }}
                                                 placeholder="Description"
                                               />
                                               <button
                                                 className="tiny-button danger"
-                                                onClick={() => removeDocxDraftTableRow(item.id, table.id, row.id)}
+                                                onClick={() => {
+                                                  const ok = window.confirm('Remove this row?')
+                                                  if (!ok) return
+                                                  removeDocxDraftTableRow(item.id, table.id, row.id)
+                                                }}
                                                 title="Remove row"
                                                 type="button"
                                               >
@@ -9845,6 +10272,8 @@ function App() {
                           if (!e || !e.tiffKey) return
                           const nextText = (e.draft ?? '').trim()
 
+                          const isThermalDistance = e.id === 'measurement_params.Distance'
+
                           // Compute next overrides for this file so we can sync the report immediately.
                           const nextOverridesForFile: Record<string, any> = { ...(viewMetadataOverrides[e.tiffKey] || {}) }
                           if (nextText === '') {
@@ -9860,9 +10289,59 @@ function App() {
                             } else {
                               nextForFile[e.id] = nextText
                             }
+
+                            // Report UX: if the user edits Thermal parameters -> Distance once,
+                            // propagate to all report images so they don't need to repeat it.
+                            if (isThermalDistance && docxDraft.length) {
+                              const nextAll: Record<string, Record<string, any>> = { ...prev }
+
+                              const apply = (tk: string) => {
+                                if (!tk) return
+                                const per = { ...(nextAll[tk] || {}) }
+                                if (nextText === '') delete per[e.id]
+                                else per[e.id] = nextText
+                                nextAll[tk] = per
+                              }
+
+                              apply(e.tiffKey)
+                              for (const d of docxDraft) {
+                                if (d.include === false) continue
+                                const entry = findMatchingTiffForImage(d.path)
+                                apply(entry?.path || '')
+                              }
+
+                              return nextAll
+                            }
+
                             return { ...prev, [e.tiffKey]: nextForFile }
                           })
                           setViewMetadataEditing(null)
+
+                          if (isThermalDistance && docxDraft.length) {
+                            // Keep the current draft tables consistent immediately.
+                            if (nextText !== '') {
+                              updateDocxDraftRowDescriptionForAllImagesByTableTitleAndRowName(
+                                'Thermal parameters',
+                                'Distance',
+                                formatMetadataValue(nextText, 'distance')
+                              )
+                            }
+
+                            // Sync metadata tables for all included report images.
+                            for (const d of docxDraft) {
+                              if (d.include === false) continue
+                              const entry = findMatchingTiffForImage(d.path)
+                              const tk = entry?.path || ''
+                              if (!tk) continue
+                              const sel = viewMetadataSelections[tk]
+
+                              const nextOverridesForTk: Record<string, any> = { ...(viewMetadataOverrides[tk] || {}) }
+                              if (nextText === '') delete nextOverridesForTk[e.id]
+                              else nextOverridesForTk[e.id] = nextText
+
+                              requestReportMetadataSyncForImage(d.path, tk, sel, nextOverridesForTk)
+                            }
+                          }
 
                           if (selectedPath && fileKind === 'image') {
                             const entry = findMatchingTiffForImage(selectedPath)
@@ -10219,6 +10698,8 @@ function App() {
                           className="tool-button danger"
                           onClick={() => {
                             if (selectedLabelIndex === null) return
+                            const ok = window.confirm('Delete the selected label?')
+                            if (!ok) return
                             const next = selectedLabels.filter((_, idx) => idx !== selectedLabelIndex)
                             setSelectedLabelIndex(null)
                             setSelectedLabels(next)
