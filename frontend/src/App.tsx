@@ -33,6 +33,20 @@ import {
 } from 'docx'
 import './App.css'
 
+import { BASE_ZOOM, RGB_VIEW_IMAGE_SCALE, VIEWER_MAX_H, VIEWER_MAX_W } from './features/view/constants'
+import { hitTestLabel as hitTestLabelMath, resizeLabel as resizeLabelMath } from './features/view/labelsMath'
+import { getRgbAlignScaleStorageKey, makeRgbAlignScaleContextKey, parseStoredScale } from './features/view/rgbAlignScale'
+import { calcViewerSize, clampPanToBounds as clampPanToBoundsMath } from './features/view/viewerMath'
+import {
+  extractFlightYawDegree,
+  extractGimbalPitchDegree,
+  extractGimbalYawDegree,
+  extractRelativeAltitude,
+  extractYawForAlignment,
+  getFlightGimbalYawAdjustmentPx,
+  getYawInterpolatedOffsetPx,
+} from './features/view/yawAlignment'
+
 type DraftTextInputProps = {
   value: string
   className?: string
@@ -174,13 +188,6 @@ declare global {
 const STORAGE_DB = 'app-storage'
 const STORAGE_STORE = 'folder-handles'
 const STORAGE_KEY = 'last-folder'
-// Multiplier applied on top of the user-controlled zoom so the default view
-// renders larger without changing the zoom UI value.
-const BASE_ZOOM = 1.44
-// When viewing an RGB image, render it slightly smaller for better framing.
-const RGB_VIEW_IMAGE_SCALE = 0.98
-const VIEWER_MAX_W = 1536
-const VIEWER_MAX_H = 1229
 
 const FAULT_TYPE_OPTIONS: Array<{ id: number; label: string }> = [
   { id: 0, label: 'Multi ByPassed' },
@@ -208,306 +215,6 @@ const getFaultTypeLabel = (value: unknown): string => {
 }
 
 const formatPossibleFaultType = (value: unknown): string => `Possible ${getFaultTypeLabel(value)}`
-
-// Bucket sizes for pitch/altitude-conditioned RGB alignment.
-// These are used to select a stored scale override (learned via Alt+wheel)
-// without introducing any new UI.
-const RGB_ALIGN_PITCH_BUCKET_DEG = 5
-const RGB_ALIGN_ALT_BUCKET_M = 5
-
-const bucketRound = (value: number, step: number) => {
-  if (!Number.isFinite(value) || !Number.isFinite(step) || step <= 0) return value
-  return Math.round(value / step) * step
-}
-
-const makeRgbAlignScaleContextKey = (gimbalPitchDeg: number | null, relativeAltM: number | null) => {
-  if (gimbalPitchDeg === null || relativeAltM === null) return null
-  const p = bucketRound(gimbalPitchDeg, RGB_ALIGN_PITCH_BUCKET_DEG)
-  const a = bucketRound(relativeAltM, RGB_ALIGN_ALT_BUCKET_M)
-  if (!Number.isFinite(p) || !Number.isFinite(a)) return null
-  return `p${p.toFixed(0)}_a${a.toFixed(0)}`
-}
-
-const getRgbAlignScaleStorageKey = (contextKey: string | null) => {
-  if (!contextKey) return 'rgb-align-scale-v1'
-  return `rgb-align-scale-v1:${contextKey}`
-}
-
-const parseStoredScale = (raw: string | null) => {
-  const n = raw ? Number(raw) : NaN
-  return Number.isFinite(n) ? Math.min(2, Math.max(0.5, n)) : null
-}
-
-// Yaw-based pixel tweaks for RGB label placement within the locked viewer frame.
-// Negative X moves left; positive Y moves down.
-//
-// IMPORTANT:
-// - `FlightYawDegree` is normalized to [0, 360) before matching.
-// - The -90° “anchor” is intentionally at -92.30 (i.e. 267.70°).
-// - Defaults are set to the current calibrated offset so behavior does not
-//   regress until other anchors are calibrated.
-const DEFAULT_RGB_YAW_OFFSET_PX = { x: -15, y: 5 }
-// If the flight yaw is within this many degrees of an anchor, use the anchor
-// offset exactly (no interpolation).
-const RGB_YAW_SNAP_DEG = 10
-const RGB_YAW_ANCHORS = [
-  { angleDeg: 0, offsetPx: { ...DEFAULT_RGB_YAW_OFFSET_PX } },
-  // +90° bucket: move labels 12px up and 10px left.
-  { angleDeg: 90, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x - 10, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 12 } },
-  // +90.80° bucket: move labels 5px further up (relative to the +90° bucket).
-  { angleDeg: 90.8, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x - 10, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 20 } },
-  // +93.70° bucket: move labels 2px down (relative to the +90° bucket).
-  { angleDeg: 93.7, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x - 10, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 13 } },
-  // +133.40° bucket: move labels 22px up and 5px right.
-  { angleDeg: 133.4, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x + 5, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 22 } },
-  // +167.20° bucket: move labels 15px down, 10px left (relative to the nearby +174.40° behavior).
-  { angleDeg: 167.2, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x - 1, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 10 } },
-  // +174.40° bucket: move labels 9px right and 20px up.
-  { angleDeg: 174.4, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x + 9, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 25 } },
-  // -180° bucket: for FlightYawDegree ≈ -177, move labels 35px up.
-  { angleDeg: 180, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 35 } },
-  // -90.10° bucket (normalized to 269.9°): move labels 14px right and 4px down (relative to the -90° bucket).
-  { angleDeg: 269.9, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x + 2, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 3 } },
-  // Some datasets may report yaw as 270° (equivalent to -90°).
-  { angleDeg: 270, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x - 12, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 7 } },
-  // -89.90° bucket (normalized to 270.1°): move labels 5px right and 2px down (relative to the -90° bucket).
-  { angleDeg: 270.1, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x - 7, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 5 } },
-  // -98.5° bucket (normalized to 261.5°): move labels 20px up and 5px left.
-  { angleDeg: 261.5, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x - 5, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 20 } },
-  // -93.9° bucket (normalized to 266.1°): move labels 35px up.
-  { angleDeg: 266.1, offsetPx: { x: DEFAULT_RGB_YAW_OFFSET_PX.x, y: DEFAULT_RGB_YAW_OFFSET_PX.y - 35 } },
-  // -92.30° normalized into [0, 360) => 267.70°
-  { angleDeg: 267.7, offsetPx: { ...DEFAULT_RGB_YAW_OFFSET_PX } },
-] as const
-
-const normAngle360 = (deg: number) => {
-  const n = deg % 360
-  return n < 0 ? n + 360 : n
-}
-
-const angleDistanceDeg = (aDeg: number, bDeg: number) => {
-  const a = normAngle360(aDeg)
-  const b = normAngle360(bDeg)
-  const diff = Math.abs(a - b)
-  return Math.min(diff, 360 - diff)
-}
-
-const toFiniteNumberOrNull = (value: unknown): number | null => {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null
-  if (typeof value === 'string') {
-    const trimmed = value.trim()
-    if (!trimmed) return null
-    const parsed = Number(trimmed)
-    return Number.isFinite(parsed) ? parsed : null
-  }
-  return null
-}
-
-const extractFlightYawDegree = (report: any | null): number | null => {
-  if (!report) return null
-
-  // Preferred structured location from backend/check_for_metada_tiff.py
-  const v1 = toFiniteNumberOrNull(report?.categories?.flight?.FlightYawDegree)
-  if (v1 !== null) return v1
-
-  // Backup locations (summary also contains DJI_FlightYawDegree)
-  const v2 = toFiniteNumberOrNull(report?.summary?.DJI_FlightYawDegree)
-  if (v2 !== null) return v2
-  const v3 = toFiniteNumberOrNull(report?.summary?.FlightYawDegree)
-  if (v3 !== null) return v3
-
-  // Some exiftool dumps may expose flattened keys.
-  const v4 = toFiniteNumberOrNull(report?.['XMP-drone-dji:FlightYawDegree'])
-  if (v4 !== null) return v4
-  const v5 = toFiniteNumberOrNull(report?.DJI_FlightYawDegree)
-  if (v5 !== null) return v5
-
-  return null
-}
-
-const extractGimbalYawDegree = (report: any | null): number | null => {
-  if (!report) return null
-
-  // Preferred structured location from backend/check_for_metada_tiff.py
-  const v1 = toFiniteNumberOrNull(report?.categories?.flight?.GimbalYawDegree)
-  if (v1 !== null) return v1
-
-  // Backup locations (summary also contains DJI_GimbalYawDegree)
-  const v2 = toFiniteNumberOrNull(report?.summary?.DJI_GimbalYawDegree)
-  if (v2 !== null) return v2
-  const v3 = toFiniteNumberOrNull(report?.summary?.GimbalYawDegree)
-  if (v3 !== null) return v3
-
-  // Some exiftool dumps may expose flattened keys.
-  const v4 = toFiniteNumberOrNull(report?.['XMP-drone-dji:GimbalYawDegree'])
-  if (v4 !== null) return v4
-  const v5 = toFiniteNumberOrNull(report?.DJI_GimbalYawDegree)
-  if (v5 !== null) return v5
-
-  return null
-}
-
-const extractGimbalPitchDegree = (report: any | null): number | null => {
-  if (!report) return null
-
-  const v1 = toFiniteNumberOrNull(report?.categories?.flight?.GimbalPitchDegree)
-  if (v1 !== null) return v1
-
-  const v2 = toFiniteNumberOrNull(report?.summary?.DJI_GimbalPitchDegree)
-  if (v2 !== null) return v2
-  const v3 = toFiniteNumberOrNull(report?.summary?.GimbalPitchDegree)
-  if (v3 !== null) return v3
-
-  const v4 = toFiniteNumberOrNull(report?.['XMP-drone-dji:GimbalPitchDegree'])
-  if (v4 !== null) return v4
-  const v5 = toFiniteNumberOrNull(report?.DJI_GimbalPitchDegree)
-  if (v5 !== null) return v5
-
-  return null
-}
-
-const extractRelativeAltitude = (report: any | null): number | null => {
-  if (!report) return null
-
-  const v1 = toFiniteNumberOrNull(report?.categories?.flight?.RelativeAltitude)
-  if (v1 !== null) return v1
-
-  const v2 = toFiniteNumberOrNull(report?.summary?.DJI_RelativeAltitude)
-  if (v2 !== null) return v2
-  const v3 = toFiniteNumberOrNull(report?.summary?.RelativeAltitude)
-  if (v3 !== null) return v3
-
-  const v4 = toFiniteNumberOrNull(report?.['XMP-drone-dji:RelativeAltitude'])
-  if (v4 !== null) return v4
-  const v5 = toFiniteNumberOrNull(report?.DJI_RelativeAltitude)
-  if (v5 !== null) return v5
-
-  return null
-}
-
-// Select a yaw angle for alignment based on similarities/differences between
-// flight yaw and gimbal yaw. In practice, gimbal yaw usually correlates better
-// with the camera view direction when they diverge.
-const extractYawForAlignment = (report: any | null): number | null => {
-  const flightYaw = extractFlightYawDegree(report)
-  const gimbalYaw = extractGimbalYawDegree(report)
-
-  if (flightYaw === null && gimbalYaw === null) return null
-  if (flightYaw === null) return gimbalYaw
-  if (gimbalYaw === null) return flightYaw
-
-  const a = normAngle360(flightYaw)
-  const b = normAngle360(gimbalYaw)
-  const diff = Math.min(Math.abs(a - b), 360 - Math.abs(a - b))
-
-  // If they broadly agree, use the circular mean for stability.
-  if (diff <= 15) {
-    const ra = (a * Math.PI) / 180
-    const rb = (b * Math.PI) / 180
-    const x = Math.cos(ra) + Math.cos(rb)
-    const y = Math.sin(ra) + Math.sin(rb)
-    const mean = Math.atan2(y, x) * (180 / Math.PI)
-    return normAngle360(mean)
-  }
-
-  // If they disagree a lot, prefer gimbal yaw (camera pointing direction).
-  return gimbalYaw
-}
-
-// Optional per-(flightYaw,gimbalYaw) correction rules.
-// Use this when small flight/gimbal differences correlate with a consistent
-// pixel shift that yaw-only interpolation can’t capture.
-const RGB_FLIGHT_GIMBAL_YAW_ADJUSTMENTS: Array<{
-  flightYawDeg: number
-  gimbalYawDeg: number
-  tolDeg: number
-  deltaPx: { x: number; y: number }
-}> = [
-  // FlightYaw=-90.00 and GimbalYaw=-91.30 => move 5px left and 5px up.
-  { flightYawDeg: 270, gimbalYawDeg: 268.7, tolDeg: 0.6, deltaPx: { x: -5, y: -5 } },
-  // FlightYaw=-177.00 (normalized to 183.00) and GimbalYaw=+9.90 => move 40px up.
-  { flightYawDeg: 183, gimbalYawDeg: 9.9, tolDeg: 0.6, deltaPx: { x: 0, y: -40 } },
-  // FlightYaw=+90.80 and GimbalYaw=-90.80 (normalized to 269.20) => move 20px left and 30px up.
-  { flightYawDeg: 90.8, gimbalYawDeg: 269.2, tolDeg: 0.6, deltaPx: { x: -20, y: -30 } },
-  // FlightYaw=-98.50 (normalized to 261.50) and GimbalYaw=+85.20 => move 20px up.
-  { flightYawDeg: 261.5, gimbalYawDeg: 85.2, tolDeg: 0.6, deltaPx: { x: 0, y: -20 } },
-  // FlightYaw=-90.10 (normalized to 269.90) and GimbalYaw=-89.80 (normalized to 270.20) => move 20px right and 3px down.
-  { flightYawDeg: 269.9, gimbalYawDeg: 270.2, tolDeg: 0.6, deltaPx: { x: 20, y: 3 } },
-  // FlightYaw=-90.00 (normalized to 270.00) and GimbalYaw=-89.40 (normalized to 270.60) => move 20px left.
-  { flightYawDeg: 270, gimbalYawDeg: 270.6, tolDeg: 0.6, deltaPx: { x: -20, y: 0 } },
-]
-
-const getFlightGimbalYawAdjustmentPx = (flightYaw: number | null, gimbalYaw: number | null) => {
-  if (flightYaw === null || gimbalYaw === null) return { x: 0, y: 0 }
-  const f = normAngle360(flightYaw)
-  const g = normAngle360(gimbalYaw)
-
-  for (const rule of RGB_FLIGHT_GIMBAL_YAW_ADJUSTMENTS) {
-    if (angleDistanceDeg(f, rule.flightYawDeg) > rule.tolDeg) continue
-    if (angleDistanceDeg(g, rule.gimbalYawDeg) > rule.tolDeg) continue
-    return { ...rule.deltaPx }
-  }
-
-  return { x: 0, y: 0 }
-}
-
-const getYawInterpolatedOffsetPx = (flightYawDegree: number | null) => {
-  if (flightYawDegree === null) return { ...DEFAULT_RGB_YAW_OFFSET_PX }
-
-  const yaw = normAngle360(flightYawDegree)
-  const anchors = [...RGB_YAW_ANCHORS].sort((a, b) => a.angleDeg - b.angleDeg)
-  if (anchors.length === 0) return { ...DEFAULT_RGB_YAW_OFFSET_PX }
-  if (anchors.length === 1) return { ...anchors[0].offsetPx }
-
-  // Snap to the nearest anchor when close enough.
-  const angleDist = (aDeg: number, bDeg: number) => {
-    const diff = Math.abs(normAngle360(aDeg) - normAngle360(bDeg))
-    return Math.min(diff, 360 - diff)
-  }
-  let nearest: (typeof anchors)[number] | null = null
-  let nearestDist = Number.POSITIVE_INFINITY
-  for (const a of anchors) {
-    const d = angleDist(yaw, a.angleDeg)
-    if (d < nearestDist) {
-      nearestDist = d
-      nearest = a
-    }
-  }
-  if (nearest && nearestDist <= RGB_YAW_SNAP_DEG) return { ...nearest.offsetPx }
-
-  // Find the clockwise segment [a, b) that contains yaw (with wrap support).
-  for (let i = 0; i < anchors.length; i++) {
-    const a = anchors[i]
-    const b = anchors[(i + 1) % anchors.length]
-    const aDeg = a.angleDeg
-    const bDeg = b.angleDeg
-
-    if (i < anchors.length - 1) {
-      if (yaw >= aDeg && yaw < bDeg) {
-        const t = (yaw - aDeg) / (bDeg - aDeg)
-        return {
-          x: a.offsetPx.x + (b.offsetPx.x - a.offsetPx.x) * t,
-          y: a.offsetPx.y + (b.offsetPx.y - a.offsetPx.y) * t,
-        }
-      }
-      continue
-    }
-
-    // Wrap segment: last -> first
-    const bWrap = bDeg + 360
-    const yawWrap = yaw < aDeg ? yaw + 360 : yaw
-    if (yawWrap >= aDeg && yawWrap < bWrap) {
-      const t = (yawWrap - aDeg) / (bWrap - aDeg)
-      return {
-        x: a.offsetPx.x + (b.offsetPx.x - a.offsetPx.x) * t,
-        y: a.offsetPx.y + (b.offsetPx.y - a.offsetPx.y) * t,
-      }
-    }
-  }
-
-  // Fallback (shouldn't happen)
-  return { ...DEFAULT_RGB_YAW_OFFSET_PX }
-}
 
 const CENTER_BOX_W = 250
 const CENTER_BOX_H = 250
@@ -7673,9 +7380,6 @@ function App() {
   ])
 
   const clampPanToBounds = (nextPan: { x: number; y: number }) => {
-    // No panning at 100% zoom.
-    if (zoom <= 1) return { x: 0, y: 0 }
-
     const viewport = imageContainerRef.current
     const baseW = imageMetrics.width
     const baseH = imageMetrics.height
@@ -7686,33 +7390,30 @@ function App() {
     if (!viewportW || !viewportH) return nextPan
 
     const viewScale = viewVariant === 'rgb' ? RGB_VIEW_IMAGE_SCALE : 1
-    const scale = zoom * BASE_ZOOM * viewScale
-    const scaledW = baseW * scale
-    const scaledH = baseH * scale
-
-    const maxX = Math.max(0, (scaledW - viewportW) / 2)
-    const maxY = Math.max(0, (scaledH - viewportH) / 2)
-
-    return {
-      x: Math.min(maxX, Math.max(-maxX, nextPan.x)),
-      y: Math.min(maxY, Math.max(-maxY, nextPan.y)),
-    }
+    return clampPanToBoundsMath({
+      zoom,
+      viewportW,
+      viewportH,
+      baseW,
+      baseH,
+      baseZoom: BASE_ZOOM,
+      viewScale,
+      pan: nextPan,
+    })
   }
 
   const getViewerSize = () => {
     const naturalW = imageMetrics.naturalWidth
     const naturalH = imageMetrics.naturalHeight
 
-    // If we don't know the image yet, keep it flexible.
-    if (!naturalW || !naturalH) return null
-
-    const availableW = Math.min(VIEWER_MAX_W, viewerHostSize.width || VIEWER_MAX_W)
-    const availableH = Math.min(VIEWER_MAX_H, viewerHostSize.height || VIEWER_MAX_H)
-    const scale = Math.min(availableW / naturalW, availableH / naturalH)
-    return {
-      width: Math.round(naturalW * scale),
-      height: Math.round(naturalH * scale),
-    }
+    return calcViewerSize({
+      naturalW,
+      naturalH,
+      hostW: viewerHostSize.width,
+      hostH: viewerHostSize.height,
+      maxW: VIEWER_MAX_W,
+      maxH: VIEWER_MAX_H,
+    })
   }
 
   useEffect(() => {
@@ -7722,17 +7423,7 @@ function App() {
   }, [zoom, imageMetrics.width, imageMetrics.height])
 
   const hitTestLabel = (point: { x: number; y: number }) => {
-    for (let i = selectedLabels.length - 1; i >= 0; i -= 1) {
-      const label = selectedLabels[i]
-      const left = label.x - label.w / 2
-      const right = label.x + label.w / 2
-      const top = label.y - label.h / 2
-      const bottom = label.y + label.h / 2
-      if (point.x >= left && point.x <= right && point.y >= top && point.y <= bottom) {
-        return i
-      }
-    }
-    return null
+    return hitTestLabelMath(selectedLabels, point)
   }
 
   const resizeLabel = (
@@ -7740,61 +7431,7 @@ function App() {
     handle: 'nw' | 'ne' | 'sw' | 'se',
     point: { x: number; y: number }
   ) => {
-    const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max)
-    const minSize = 0.01
-
-    // Start from the current label bounds (normalized 0..1).
-    let left = origin.x - origin.w / 2
-    let right = origin.x + origin.w / 2
-    let top = origin.y - origin.h / 2
-    let bottom = origin.y + origin.h / 2
-
-    // Clamp the origin bounds first (defensive: avoids negative sizes if input is slightly out-of-range).
-    left = clamp(left, 0, 1)
-    right = clamp(right, 0, 1)
-    top = clamp(top, 0, 1)
-    bottom = clamp(bottom, 0, 1)
-
-    // Ensure origin has at least min size.
-    if (right - left < minSize) {
-      const mid = (left + right) / 2
-      left = clamp(mid - minSize / 2, 0, 1 - minSize)
-      right = left + minSize
-    }
-    if (bottom - top < minSize) {
-      const mid = (top + bottom) / 2
-      top = clamp(mid - minSize / 2, 0, 1 - minSize)
-      bottom = top + minSize
-    }
-
-    // Move only the dragged corner, keeping the opposite corner fixed.
-    switch (handle) {
-      case 'nw':
-        left = clamp(point.x, 0, right - minSize)
-        top = clamp(point.y, 0, bottom - minSize)
-        break
-      case 'ne':
-        right = clamp(point.x, left + minSize, 1)
-        top = clamp(point.y, 0, bottom - minSize)
-        break
-      case 'sw':
-        left = clamp(point.x, 0, right - minSize)
-        bottom = clamp(point.y, top + minSize, 1)
-        break
-      case 'se':
-        right = clamp(point.x, left + minSize, 1)
-        bottom = clamp(point.y, top + minSize, 1)
-        break
-    }
-
-    const w = right - left
-    const h = bottom - top
-    return {
-      x: left + w / 2,
-      y: top + h / 2,
-      w: clamp(w, minSize, 1),
-      h: clamp(h, minSize, 1),
-    }
+    return resizeLabelMath(origin, handle, point)
   }
 
   const sortNodes = (nodes: TreeNode[]) =>
