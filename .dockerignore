@@ -22,6 +22,10 @@ backend/static/orthomosaic_sessions/
 **/*.pt
 **/*.onnx
 
+# Allow only the two default weights to be baked into the image when present.
+!backend/models/best.pt
+!backend/models/best_8_class.pt
+
 # Editor
 .vscode/
 .DS_Store

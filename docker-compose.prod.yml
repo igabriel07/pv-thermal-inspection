@@ -10,9 +10,6 @@ services:
       # Mount weights under backend/models on the host.
       - FAULT_MODEL_PATH=/app/backend/models/best.pt
       - FAULT_TYPE_MODEL_PATH=/app/backend/models/best_8_class.pt
-    volumes:
-      # Put your .pt weights in backend/models/ on the server.
-      - ./backend/models:/app/backend/models:ro
 
   frontend:
     build:

@@ -47,6 +47,10 @@ backend/*.png
 **/*.engine
 **/*.weights
 
+# Allow only the two weights used by default.
+!backend/models/best.pt
+!backend/models/best_8_class.pt
+
 # Vendor SDK data (keep source, ignore bulky datasets/samples)
 backend/dji_thermal_sdk/dataset/
 backend/dji_thermal_sdk/sample/

@@ -26,6 +26,7 @@ Optional environment variables (see `.env.example`):
 Notes:
 - YOLO weight files (`*.pt`, etc.) are intentionally ignored by git via `.gitignore`.
 	Place them locally (default: `backend/models/`) or point to them with the env vars above.
+	This repo allows tracking only `backend/models/best.pt` and `backend/models/best_8_class.pt` as explicit exceptions.
 
 ## Frontend
 
@@ -52,9 +53,7 @@ This repo includes a production compose file + reverse proxy setup:
 ### Prereqs
 - A Linux server/VPS with Docker + Compose installed
 - A domain name pointing to your server IP (DNS A/AAAA record)
-- The YOLO weights placed on the server (git ignores `*.pt`):
-	- `backend/models/best.pt`
-	- `backend/models/best_8_class.pt`
+- YOLO weights available at `backend/models/best.pt` and `backend/models/best_8_class.pt` (either committed as repo exceptions or placed manually).
 
 ### Run
 From the repo root on the server:
