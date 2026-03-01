@@ -65,6 +65,15 @@ import {
   type FileEntry,
   type TreeNode,
 } from './features/workspace/fileTree'
+import {
+  getFaultsDir as resolveFaultsDir,
+  getRgbRootDir as resolveRgbRootDir,
+  getWorkflowRootDir as resolveWorkflowRootDir,
+  getWorkspaceProjectRootDir as resolveWorkspaceProjectRootDir,
+  getWorkspaceSubdir as resolveWorkspaceSubdir,
+  getWorkspaceSubdirForPath as resolveWorkspaceSubdirForPath,
+} from './features/workspace/dirResolvers'
+import { clearDirectory, readJsonFile, readTextFile, writeBinaryFile, writeTextFile } from './features/workspace/fileIO'
 import { clearStoredFolderHandle, getStoredFolderHandle, storeFolderHandle } from './features/workspace/storage'
 
 type DraftTextInputProps = {
@@ -1725,103 +1734,32 @@ function App() {
     return currentDirImagePaths[nextIndex] ?? null
   }, [canNavigateDirImages, canNavigateScopedImages, currentDirImageIndex, currentDirImagePaths, scopedImagePaths, selectedPath])
 
-  const getFaultsDir = async (handle: FileSystemDirectoryHandle, create: boolean) => {
-    if (!handle.getDirectoryHandle) return null
-    return handle.getDirectoryHandle('faults', { create })
-  }
+  const getFaultsDir = async (handle: FileSystemDirectoryHandle, create: boolean) => resolveFaultsDir(handle, create)
 
-  const getWorkspaceProjectRootDir = async (create: boolean) => {
-    if (!folderHandle) return null
-    if (!folderHandle.getDirectoryHandle) return null
+  const getWorkspaceProjectRootDir = async (create: boolean) =>
+    resolveWorkspaceProjectRootDir({
+      folderHandle,
+      openedThermalFolderDirectly,
+      openedRgbFolderDirectly,
+      effectiveThermalFolderPath,
+      create,
+    })
 
-    // If the user opened the `thermal/` (or `rgb/`) folder directly, we cannot create
-    // a sibling `workspace/` folder because we don't have access to the parent.
-    if (openedThermalFolderDirectly || openedRgbFolderDirectly) return null
-
-    // If we can't detect a thermal folder path yet (e.g. tree not populated), assume
-    // the opened folder is the project root.
-    if (!effectiveThermalFolderPath) return folderHandle
-
-    const projectRootPath = getParentDirPath(effectiveThermalFolderPath)
-    const parts = projectRootPath ? projectRootPath.split('/').filter(Boolean) : []
-    let dir: FileSystemDirectoryHandle = folderHandle
-    for (const part of parts) {
-      if (!dir.getDirectoryHandle) return null
-      dir = await dir.getDirectoryHandle(part, { create })
-    }
-    return dir
-  }
-
-  const getWorkspaceRootDir = async (create: boolean) => {
-    const projectRoot = await getWorkspaceProjectRootDir(create)
-    if (!projectRoot) return null
-    if (!projectRoot.getDirectoryHandle) return null
-    return projectRoot.getDirectoryHandle(WORKSPACE_DIR, { create })
-  }
-
-  const getWorkspaceSubdir = async (name: string, create: boolean) => {
-    const workspaceRoot = await getWorkspaceRootDir(create)
-    if (!workspaceRoot) return null
-    if (!workspaceRoot.getDirectoryHandle) return null
-    return workspaceRoot.getDirectoryHandle(name, { create })
-  }
+  const getWorkspaceSubdir = async (name: string, create: boolean) =>
+    resolveWorkspaceSubdir({
+      folderHandle,
+      openedThermalFolderDirectly,
+      openedRgbFolderDirectly,
+      effectiveThermalFolderPath,
+      name,
+      create,
+    })
 
   // Resolve `workspace/<subdir>` for a specific file path.
   // This makes reads/writes stable even when the opened folder contains multiple sessions
   // (e.g. `data/<uuid>/thermal/...`), by anchoring `workspace/` next to that session's `thermal/`.
-  const getWorkspaceSubdirForPath = async (targetPath: string, name: string, create: boolean) => {
-    if (!folderHandle) return null
-    if (!folderHandle.getDirectoryHandle) return null
-
-    const normalizedTarget = normalizePath(String(targetPath || ''))
-
-    const parts = normalizedTarget.split('/').filter(Boolean)
-    const thermalIdx = parts.findIndex((p) => p.toLowerCase() === 'thermal')
-    let projectRootParts = thermalIdx >= 0 ? parts.slice(0, thermalIdx) : []
-
-    // If `targetPath` looks like it's rooted at `thermal/...` but the detected thermal folder is
-    // nested (e.g. `thermal1_images/thermal/...`), infer the missing prefix from the detection.
-    if (thermalIdx === 0 && effectiveThermalFolderPath) {
-      const effParts = effectiveThermalFolderPath.split('/').filter(Boolean)
-      const effThermalIdx = effParts.findIndex((p) => p.toLowerCase() === 'thermal')
-      if (effThermalIdx > 0) {
-        projectRootParts = effParts.slice(0, effThermalIdx)
-      }
-    }
-
-    let projectRoot: FileSystemDirectoryHandle = folderHandle
-    for (const part of projectRootParts) {
-      if (!projectRoot.getDirectoryHandle) return null
-      projectRoot = await projectRoot.getDirectoryHandle(part, { create })
-    }
-
-    if (!projectRoot.getDirectoryHandle) return null
-    // Prefer the workspace folder next to the session's `thermal/`.
-    try {
-      const ws = await projectRoot.getDirectoryHandle(WORKSPACE_DIR, { create })
-      if (ws?.getDirectoryHandle) {
-        return ws.getDirectoryHandle(name, { create })
-      }
-    } catch {
-      // ignore and fall back for reads
-    }
-
-    // Fallback for reads: if `workspace/` exists at the opened root, use it.
-    // This supports older layouts where the user opened the session root directly.
-    if (!create) {
-      try {
-        const wsAtRoot = await folderHandle.getDirectoryHandle(WORKSPACE_DIR, { create: false })
-        if (wsAtRoot?.getDirectoryHandle) {
-          const hit = await wsAtRoot.getDirectoryHandle(name, { create: false })
-          if (hit) return hit
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    return null
-  }
+  const getWorkspaceSubdirForPath = async (targetPath: string, name: string, create: boolean) =>
+    resolveWorkspaceSubdirForPath({ folderHandle, effectiveThermalFolderPath, targetPath, name, create })
 
   const getWorkspaceThermalLabelsDirForPath = async (targetPath: string, create: boolean) =>
     getWorkspaceSubdirForPath(targetPath, WORKSPACE_THERMAL_LABELS_DIR, create)
@@ -1850,37 +1788,10 @@ function App() {
     return root.getDirectoryHandle('labels', { create })
   }
 
-  const getWorkflowRootDir = async (create: boolean) => {
-    if (!folderHandle) return null
-    const baseThermalPath = effectiveThermalFolderPath
-    if (!baseThermalPath) return folderHandle
-    if (!folderHandle.getDirectoryHandle) return null
-    const parts = baseThermalPath.split('/').filter(Boolean)
-    let dir: FileSystemDirectoryHandle = folderHandle
-    for (const part of parts) {
-      if (!dir.getDirectoryHandle) return null
-      dir = await dir.getDirectoryHandle(part, { create })
-    }
-    return dir
-  }
+  const getWorkflowRootDir = async (create: boolean) => resolveWorkflowRootDir({ folderHandle, effectiveThermalFolderPath, create })
 
-  const getRgbRootDir = async (create: boolean) => {
-    if (!folderHandle) return null
-    // Prefer the detected RGB folder path from the file tree.
-    // Fallback: derive the parent folder from the currently viewed RGB image path.
-    const fallbackRgbPath =
-      viewVariant === 'rgb' && selectedViewPath ? selectedViewPath.split('/').slice(0, -1).join('/') : ''
-    const basePath = effectiveRgbFolderPath || fallbackRgbPath
-    if (!basePath) return folderHandle
-    if (!folderHandle.getDirectoryHandle) return null
-    const parts = basePath.split('/').filter(Boolean)
-    let dir: FileSystemDirectoryHandle = folderHandle
-    for (const part of parts) {
-      if (!dir.getDirectoryHandle) return null
-      dir = await dir.getDirectoryHandle(part, { create })
-    }
-    return dir
-  }
+  const getRgbRootDir = async (create: boolean) =>
+    resolveRgbRootDir({ folderHandle, effectiveRgbFolderPath, viewVariant, selectedViewPath, create })
 
   const getRgbLabelsDir = async (create: boolean) => {
     return getWorkspaceRgbLabelsDir(create)
@@ -1896,17 +1807,6 @@ function App() {
 
   const getWorkflowFaultsDir = async (create: boolean) => {
     return getWorkspaceThermalFaultsDir(create)
-  }
-
-  const readTextFile = async (dir: FileSystemDirectoryHandle, name: string) => {
-    if (!dir.getFileHandle) return null
-    try {
-      const fileHandle = await dir.getFileHandle(name)
-      const file = await fileHandle.getFile()
-      return await file.text()
-    } catch {
-      return null
-    }
   }
 
   const parseYoloNumber = (raw: unknown) => {
@@ -2488,17 +2388,6 @@ function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewVariant, selectedViewPath, selectedPath, folderHandle, effectiveRgbFolderPath, activeAction])
-
-
-  const readJsonFile = async <T,>(dir: FileSystemDirectoryHandle, name: string): Promise<T | null> => {
-    const text = await readTextFile(dir, name)
-    if (!text) return null
-    try {
-      return JSON.parse(text) as T
-    } catch {
-      return null
-    }
-  }
 
   const parseCenterFlagsDisk = (raw: unknown): { meta: CenterFlagsDiskV2['meta'] | null; flags: Record<string, 0 | 1> } => {
     if (!raw || typeof raw !== 'object') return { meta: null, flags: {} }
@@ -5972,34 +5861,9 @@ function App() {
     })
   }, [activeAction, docxDraft])
 
-  const writeTextFile = async (dir: FileSystemDirectoryHandle, name: string, content: string) => {
-    if (!dir.getFileHandle) throw new Error('Folder write is not available in this browser.')
-    const fileHandle = await dir.getFileHandle(name, { create: true })
-    if (!fileHandle.createWritable) throw new Error('Unable to write files: File System Access API is unavailable or permission is missing.')
-    const writable = await fileHandle.createWritable()
-    await writable.write(content)
-    await writable.close()
-  }
-
-  const writeBinaryFile = async (dir: FileSystemDirectoryHandle, name: string, content: Blob | ArrayBuffer) => {
-    if (!dir.getFileHandle) throw new Error('Folder write is not available in this browser.')
-    const fileHandle = await dir.getFileHandle(name, { create: true })
-    if (!fileHandle.createWritable) throw new Error('Unable to write files: File System Access API is unavailable or permission is missing.')
-    const writable = await fileHandle.createWritable()
-    await writable.write(content)
-    await writable.close()
-  }
-
   const writeCenterFaultFlags = async (faultsDir: FileSystemDirectoryHandle, flags: Record<string, 0 | 1>) => {
     const payload: CenterFlagsDiskV2 = { meta: CURRENT_CENTER_FLAGS_META, flags }
     await writeTextFile(faultsDir, CENTER_FLAGS_FILE, JSON.stringify(payload, null, 2))
-  }
-
-  const clearDirectory = async (dir: FileSystemDirectoryHandle) => {
-    if (!dir.entries || !dir.removeEntry) return
-    for await (const [name, entry] of dir.entries()) {
-      await dir.removeEntry(name, { recursive: entry.kind === 'directory' })
-    }
   }
 
   const runScan = async (overwrite: boolean) => {
