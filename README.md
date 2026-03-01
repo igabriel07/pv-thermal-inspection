@@ -42,3 +42,27 @@ If you deploy frontend and backend under different origins, set `VITE_API_BASE_U
 
 Docker (builds both services):
 - `docker compose up --build`
+
+## Deploy online (Docker + HTTPS)
+
+This repo includes a production compose file + reverse proxy setup:
+- `docker-compose.prod.yml` (frontend + backend + Caddy)
+- `Caddyfile` (routes `/api/*` to backend and everything else to frontend)
+
+### Prereqs
+- A Linux server/VPS with Docker + Compose installed
+- A domain name pointing to your server IP (DNS A/AAAA record)
+- The YOLO weights placed on the server (git ignores `*.pt`):
+	- `backend/models/best.pt`
+	- `backend/models/best_8_class.pt`
+
+### Run
+From the repo root on the server:
+- `DOMAIN=app.example.com docker compose -f docker-compose.prod.yml up -d --build`
+
+Then open:
+- `https://app.example.com`
+
+Notes:
+- Ensure ports 80/443 are open in the firewall/security group.
+- If you don't have a domain yet, you can run HTTP-only by setting `DOMAIN=:80` (no TLS).
