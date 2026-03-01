@@ -1,0 +1,38 @@
+app = "pv-thermal-inspection"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile.fly"
+
+[env]
+  # Same-origin deployment via Caddy => simplest CORS.
+  CORS_ALLOW_ORIGINS = "*"
+  FAULT_MODEL_PATH = "/app/backend/models/best.pt"
+  FAULT_TYPE_MODEL_PATH = "/app/backend/models/best_8_class.pt"
+  # Optional: speed up cold start by not preloading YOLO at boot.
+  # PRELOAD_MODEL = "0"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [services.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 40
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1024mb"

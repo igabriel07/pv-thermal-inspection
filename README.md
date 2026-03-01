@@ -65,3 +65,25 @@ Then open:
 Notes:
 - Ensure ports 80/443 are open in the firewall/security group.
 - If you don't have a domain yet, you can run HTTP-only by setting `DOMAIN=:80` (no TLS).
+
+## Deploy (free, no domain) on Fly.io
+
+This repo includes a single-container Fly setup that:
+- runs the FastAPI backend on `127.0.0.1:8000`
+- serves the built frontend via Caddy on `:8080`
+- proxies `/api/*` to the backend
+- scales to zero (`min_machines_running = 0`) and auto-starts on request
+
+Files:
+- `fly.toml`
+- `Dockerfile.fly`
+- `Caddyfile.fly`
+
+Steps:
+1) Install `flyctl` and login: `fly auth login`
+2) From repo root: `fly launch --no-deploy`
+3) Deploy: `fly deploy`
+
+Notes:
+- First request after idle will be slower (cold start + optional YOLO preload).
+- If cold starts are too slow, set `PRELOAD_MODEL=0` in `fly.toml`.

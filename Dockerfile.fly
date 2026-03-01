@@ -1,0 +1,53 @@
+# Build frontend
+FROM node:20-alpine AS frontend-build
+WORKDIR /app
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+# Vite reads VITE_* vars at build time; keep same-origin by default.
+ARG VITE_API_BASE_URL=
+ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+RUN npm run build
+
+# Build backend deps
+FROM python:3.12-slim AS backend-base
+
+# Runtime deps:
+# - OpenCV: libgl1 libglib2.0-0
+# - Torch sometimes needs libgomp1
+# - LibreOffice for /api/convert/docx-to-pdf
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    libreoffice \
+    fonts-dejavu-core \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY backend/requirements.txt backend/requirements.txt
+RUN pip install --no-cache-dir -r backend/requirements.txt
+
+COPY backend/ backend/
+
+# Download Caddy static binary (Fly terminates TLS at the edge; we serve HTTP)
+RUN curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy \
+  && chmod +x /usr/local/bin/caddy
+
+# Copy frontend dist
+COPY --from=frontend-build /app/dist /srv
+
+# Caddy config + entrypoint
+COPY Caddyfile.fly /etc/caddy/Caddyfile
+COPY scripts/fly-entrypoint.sh /fly-entrypoint.sh
+RUN chmod +x /fly-entrypoint.sh
+
+# Fly typically routes to 8080 inside the container.
+ENV PORT=8080
+EXPOSE 8080
+
+CMD ["/fly-entrypoint.sh"]
