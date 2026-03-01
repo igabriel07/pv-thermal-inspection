@@ -1,0 +1,7 @@
+export const WORKSPACE_DIR = 'workspace'
+export const WORKSPACE_THERMAL_FAULTS_DIR = 'thermal_faults'
+export const WORKSPACE_THERMAL_LABELS_DIR = 'thermal_labels'
+export const WORKSPACE_THERMAL_LABELS_CENTER_DIR = 'thermal_labels_center'
+export const WORKSPACE_THERMAL_METADATA_DIR = 'thermal_metadata'
+export const WORKSPACE_THERMAL_TEMPS_CSV_DIR = 'thermal_temperatures_csvs'
+export const WORKSPACE_RGB_LABELS_DIR = 'rgb_labels'

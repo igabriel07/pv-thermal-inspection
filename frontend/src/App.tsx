@@ -46,6 +46,16 @@ import {
   getFlightGimbalYawAdjustmentPx,
   getYawInterpolatedOffsetPx,
 } from './features/view/yawAlignment'
+import {
+  WORKSPACE_DIR,
+  WORKSPACE_RGB_LABELS_DIR,
+  WORKSPACE_THERMAL_FAULTS_DIR,
+  WORKSPACE_THERMAL_LABELS_CENTER_DIR,
+  WORKSPACE_THERMAL_LABELS_DIR,
+  WORKSPACE_THERMAL_METADATA_DIR,
+  WORKSPACE_THERMAL_TEMPS_CSV_DIR,
+} from './features/workspace/constants'
+import { getParentDirPath, normalizePath } from './features/workspace/pathUtils'
 
 type DraftTextInputProps = {
   value: string
@@ -1376,13 +1386,6 @@ function App() {
     return Number.isFinite(ts) ? ts : null
   }
 
-  const normalizePath = (path: string) =>
-    path
-      .replace(/\\/g, '/')
-      .replace(/^\.\/+/, '')
-      .replace(/^\/+/, '')
-      .replace(/\/\.\//g, '/')
-
   const filePathByLowerCase = useMemo(() => {
     const out: Record<string, string> = {}
     for (const p of Object.keys(fileMap)) {
@@ -1754,20 +1757,6 @@ function App() {
     if (!effectiveThermalFolderPath) return true
     return path === effectiveThermalFolderPath || path.startsWith(`${effectiveThermalFolderPath}/`)
   }
-
-  const getParentDirPath = (path: string) => {
-    const parts = path.split('/').filter(Boolean)
-    parts.pop()
-    return parts.join('/')
-  }
-
-  const WORKSPACE_DIR = 'workspace'
-  const WORKSPACE_THERMAL_FAULTS_DIR = 'thermal_faults'
-  const WORKSPACE_THERMAL_LABELS_DIR = 'thermal_labels'
-  const WORKSPACE_THERMAL_LABELS_CENTER_DIR = 'thermal_labels_center'
-  const WORKSPACE_THERMAL_METADATA_DIR = 'thermal_metadata'
-  const WORKSPACE_THERMAL_TEMPS_CSV_DIR = 'thermal_temperatures_csvs'
-  const WORKSPACE_RGB_LABELS_DIR = 'rgb_labels'
 
   const [navScope, setNavScope] = useState<'tree' | 'faultsList' | null>(null)
 

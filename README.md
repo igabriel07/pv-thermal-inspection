@@ -20,7 +20,12 @@ Faster local dev tips:
 
 Optional environment variables (see `.env.example`):
 - `CORS_ALLOW_ORIGINS` (comma-separated, or `*`)
-- `FAULT_MODEL_PATH`, `FAULT_IMGSZ`, `FAULT_CONF`, `FAULT_IOU`
+- `FAULT_MODEL_PATH`, `FAULT_TYPE_MODEL_PATH`
+- `FAULT_IMGSZ`, `FAULT_CONF`, `FAULT_IOU`
+
+Notes:
+- YOLO weight files (`*.pt`, etc.) are intentionally ignored by git via `.gitignore`.
+	Place them locally (default: `backend/models/`) or point to them with the env vars above.
 
 ## Frontend
 
