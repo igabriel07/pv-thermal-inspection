@@ -1,0 +1,46 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      # If you serve via the same origin (Caddy proxy), CORS is mostly irrelevant.
+      # Keep permissive by default for simpler first deploy.
+      - CORS_ALLOW_ORIGINS=*
+      # Mount weights under backend/models on the host.
+      - FAULT_MODEL_PATH=/app/backend/models/best.pt
+      - FAULT_TYPE_MODEL_PATH=/app/backend/models/best_8_class.pt
+    volumes:
+      # Put your .pt weights in backend/models/ on the server.
+      - ./backend/models:/app/backend/models:ro
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        # Empty => same-origin (/api/*). Caddy will proxy /api to backend.
+        VITE_API_BASE_URL: ""
+    depends_on:
+      - backend
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      # Set this on the server, e.g. DOMAIN=app.example.com
+      - DOMAIN=localhost
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+      - backend
+
+volumes:
+  caddy_data:
+  caddy_config:

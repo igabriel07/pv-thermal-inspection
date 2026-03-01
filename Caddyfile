@@ -1,0 +1,8 @@
+{$DOMAIN} {
+  encode gzip
+
+  @api path /api/*
+  reverse_proxy @api backend:8000
+
+  reverse_proxy frontend:80
+}

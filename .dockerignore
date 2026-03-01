@@ -1,0 +1,27 @@
+# Git/OS
+.git
+.gitignore
+
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+.venv/
+
+# Node/Vite
+**/node_modules/
+frontend/dist/
+
+# App runtime outputs / large private data
+backups/
+data/
+backend/thermal_out/
+backend/static/orthomosaic_sessions/
+
+# ML weights (keep out of build context; mount at runtime)
+**/*.pt
+**/*.onnx
+
+# Editor
+.vscode/
+.DS_Store
