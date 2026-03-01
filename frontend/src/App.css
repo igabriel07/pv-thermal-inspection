@@ -226,12 +226,34 @@
 .report-left-window {
   flex: 1;
   border: 1px solid #e2e8f0;
-  border-radius: 14px;
-  padding: 12px;
+  border-radius: 16px;
+  padding: 14px 10px;
   background: #f8fafc;
+  color: #0f172a;
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+.report-left-window.report-left-window-combined {
+  gap: 12px;
+}
+
+.report-left-section {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.report-left-section + .report-left-section {
+  padding-top: 12px;
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.report-left-section .description-rows,
+.report-left-section .equipment-rows {
+  flex: 1;
 }
 
 .report-left-window-header {
@@ -267,15 +289,9 @@ body.theme-dark .card.card-report .report-left-window-add {
   border-color: rgba(148, 163, 184, 0.22);
 }
 
-body.theme-light .report-left-window {
-  background: #0f172a;
-  border-color: rgba(148, 163, 184, 0.2);
-  color: #e5e7eb;
-}
-
 body.theme-dark .card.card-report .report-left-window {
-  background: #0f172a;
-  border-color: rgba(148, 163, 184, 0.2);
+  background: #0b1220;
+  border-color: rgba(148, 163, 184, 0.18);
   color: #e5e7eb;
 }
 
@@ -336,16 +352,51 @@ body.theme-dark .card.card-report .description-row-text {
   padding-right: 4px;
 }
 
-.equipment-row {
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  border-radius: 12px;
-  padding: 10px;
-  background: rgba(255, 255, 255, 0.7);
+/* Report page scrollbars (match the rest of the app, e.g. .tree / .metadata-panel) */
+.description-rows,
+.equipment-rows,
+.docx-draft-list,
+.docx-preview-host {
+  scrollbar-color: rgba(56, 189, 248, 0.6) rgba(5, 10, 24, 0.4);
+  scrollbar-width: thin;
 }
 
-body.theme-light .card.card-report .equipment-row {
-  background: rgba(2, 6, 23, 0.35);
-  border-color: rgba(148, 163, 184, 0.2);
+.description-rows::-webkit-scrollbar,
+.equipment-rows::-webkit-scrollbar,
+.docx-draft-list::-webkit-scrollbar,
+.docx-preview-host::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+
+.description-rows::-webkit-scrollbar-track,
+.equipment-rows::-webkit-scrollbar-track,
+.docx-draft-list::-webkit-scrollbar-track,
+.docx-preview-host::-webkit-scrollbar-track {
+  background: rgba(5, 10, 24, 0.4);
+  border-radius: 10px;
+}
+
+.description-rows::-webkit-scrollbar-thumb,
+.equipment-rows::-webkit-scrollbar-thumb,
+.docx-draft-list::-webkit-scrollbar-thumb,
+.docx-preview-host::-webkit-scrollbar-thumb {
+  background: rgba(56, 189, 248, 0.6);
+  border-radius: 10px;
+}
+
+.description-rows::-webkit-scrollbar-thumb:hover,
+.equipment-rows::-webkit-scrollbar-thumb:hover,
+.docx-draft-list::-webkit-scrollbar-thumb:hover,
+.docx-preview-host::-webkit-scrollbar-thumb:hover {
+  background: rgba(56, 189, 248, 0.8);
+}
+
+.equipment-row {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 10px;
+  background: #ffffff;
 }
 
 body.theme-dark .card.card-report .equipment-row {
@@ -460,10 +511,10 @@ body.theme-dark .card.card-report .equipment-row-clear-image {
 }
 
 .description-row {
-  border: 1px solid rgba(148, 163, 184, 0.22);
+  border: 1px solid #e2e8f0;
   border-radius: 12px;
   padding: 10px;
-  background: rgba(11, 18, 32, 0.8);
+  background: #ffffff;
 }
 
 body.theme-dark .card.card-report .description-row {
@@ -525,9 +576,10 @@ body.theme-dark .card.card-report .description-textarea {
 .report-sidebar-window {
   flex: 1;
   border: 1px solid #e2e8f0;
-  border-radius: 14px;
-  padding: 12px;
+  border-radius: 16px;
+  padding: 14px 10px;
   background: #f8fafc;
+  color: #0f172a;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -540,8 +592,8 @@ body.theme-light .report-sidebar-window {
 }
 
 body.theme-dark .card.card-report .report-sidebar-window {
-  background: #0f172a;
-  border-color: rgba(148, 163, 184, 0.2);
+  background: #0b1220;
+  border-color: rgba(148, 163, 184, 0.18);
   color: #e5e7eb;
 }
 
@@ -938,6 +990,81 @@ body.theme-dark .card.card-report .docx-preview-host .docx-wrapper > section.doc
   background: rgb(255, 255, 255);
 }
 
+/* Light mode: make report windows match dark mode styling */
+body.theme-light .card.card-report .report-left-window-add {
+  background: rgba(11, 18, 32, 0.8);
+  border-color: rgba(148, 163, 184, 0.22);
+}
+
+body.theme-light .card.card-report .report-left-window {
+  background: #0b1220;
+  border-color: rgba(148, 163, 184, 0.18);
+  color: #e5e7eb;
+}
+
+body.theme-light .card.card-report .report-sidebar-window {
+  background: #0b1220;
+  border-color: rgba(148, 163, 184, 0.18);
+  color: #e5e7eb;
+}
+
+body.theme-light .card.card-report .description-row,
+body.theme-light .card.card-report .equipment-row {
+  background: rgba(2, 6, 23, 0.35);
+  border-color: rgba(148, 163, 184, 0.2);
+}
+
+body.theme-light .card.card-report .description-row-remove,
+body.theme-light .card.card-report .equipment-row-remove {
+  background: rgba(11, 18, 32, 0.8);
+  border-color: rgba(148, 163, 184, 0.22);
+}
+
+body.theme-light .card.card-report .equipment-row-title,
+body.theme-light .card.card-report .description-row-title,
+body.theme-light .card.card-report .description-row-text,
+body.theme-light .card.card-report .equipment-row-text,
+body.theme-light .card.card-report .description-input,
+body.theme-light .card.card-report .description-textarea {
+  background: rgba(11, 18, 32, 0.8);
+  border-color: rgba(148, 163, 184, 0.22);
+  color: #e5e7eb;
+}
+
+body.theme-light .card.card-report .equipment-row-image-preview img {
+  background: rgba(2, 6, 23, 0.35);
+  border-color: rgba(148, 163, 184, 0.2);
+}
+
+body.theme-light .card.card-report .equipment-row-clear-image {
+  background: rgba(11, 18, 32, 0.8);
+  border-color: rgba(148, 163, 184, 0.22);
+}
+
+body.theme-light .card.card-report .report-editor {
+  background: rgba(2, 6, 23, 0.35);
+  border-color: rgba(148, 163, 184, 0.22);
+  color: #e5e7eb;
+}
+
+body.theme-light .card.card-report .docx-draft {
+  background: rgba(2, 6, 23, 0.22);
+  border-color: rgba(148, 163, 184, 0.22);
+  color: #e5e7eb;
+}
+
+body.theme-light .card.card-report .docx-draft-item {
+  background: #0b1220;
+  border-color: rgba(148, 163, 184, 0.2);
+}
+
+body.theme-light .card.card-report .docx-field-input,
+body.theme-light .card.card-report .docx-field-textarea {
+  background: #0b1220;
+  border-color: rgba(148, 163, 184, 0.2);
+  color: #e5e7eb;
+}
+
 @keyframes dropdown-in {
   from {
     opacity: 0;
@@ -987,8 +1114,26 @@ body.theme-dark .card.card-report .docx-preview-host .docx-wrapper > section.doc
   min-height: calc(100vh - 52px);
   height: calc(100vh - 52px);
   position: relative;
-  padding: 8px;
+  padding: 8px 8px 34px;
   gap: 10px;
+}
+
+.app-footer {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 6px 12px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1.2;
+  opacity: 0.7;
+  z-index: 5;
+  pointer-events: none;
+}
+
+body.theme-dark .app-footer {
+  color: #e5e7eb;
 }
 
 .explorer {
@@ -1035,6 +1180,11 @@ body.theme-light .tree-item.file.active {
 .explorer-pane-tree {
   /* Keep the folder tree from taking over the whole left explorer. */
   flex: 0 0 220px;
+}
+
+.explorer-pane-tree.explorer-pane-tree-full {
+  /* On the Welcome/Home page, let the tree fill the full height. */
+  flex: 1 1 auto;
 }
 
 .explorer-pane + .explorer-pane {
@@ -1530,6 +1680,40 @@ body.theme-dark .card.card-scan {
   color: #e5e7eb;
 }
 
+body.theme-dark .card.home-card {
+  /* Match Scanner card container styling in dark mode */
+  background: #111827;
+  border-color: rgba(148, 163, 184, 0.2);
+  color: #e5e7eb;
+}
+
+body.theme-dark .home-hero-text h1 {
+  color: #e5e7eb;
+}
+
+body.theme-dark .home-hero-text p {
+  color: rgba(226, 232, 240, 0.88);
+}
+
+body.theme-dark .home-badge {
+  background: rgba(99, 102, 241, 0.22);
+  color: #c7d2fe;
+}
+
+body.theme-dark .home-hero-card {
+  background: #0f172a;
+  border-color: rgba(148, 163, 184, 0.2);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+body.theme-dark .home-hero-title {
+  color: rgba(148, 163, 184, 0.95);
+}
+
+body.theme-dark .home-hero-card ul {
+  color: rgba(226, 232, 240, 0.9);
+}
+
 body.theme-dark .card.card-scan .scan-status {
   background: rgba(30, 41, 59, 0.9);
   color: #c7d2fe;
@@ -1650,7 +1834,7 @@ body.theme-light .view-filename {
 
 .home-hero {
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
   gap: 24px;
   align-items: stretch;
 }
@@ -1708,6 +1892,155 @@ body.theme-light .view-filename {
   display: grid;
   gap: 6px;
 }
+
+/* Help / Documentation */
+.card.card-help {
+  padding: 24px 28px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+body.theme-dark .card.card-help {
+  background: #111827;
+  border-color: rgba(148, 163, 184, 0.2);
+  color: #e5e7eb;
+}
+
+.help-tabs {
+  display: inline-flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.help-lang {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.help-lang-button {
+  padding: 6px 10px;
+  font-size: 12px;
+  border-radius: 9px;
+  box-shadow: none;
+}
+
+.help-lang-button.active {
+  border-color: rgba(37, 99, 235, 0.45);
+  box-shadow: 0 8px 18px rgba(37, 99, 235, 0.18);
+  transform: translateY(-1px);
+}
+
+
+.help-doc-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 6px;
+  scrollbar-color: rgba(56, 189, 248, 0.6) rgba(5, 10, 24, 0.4);
+  scrollbar-width: thin;
+}
+
+.help-doc-scroll::-webkit-scrollbar {
+  height: 8px;
+  width: 8px;
+}
+
+.help-doc-scroll::-webkit-scrollbar-track {
+  background: rgba(5, 10, 24, 0.4);
+  border-radius: 10px;
+}
+
+.help-doc-scroll::-webkit-scrollbar-thumb {
+  background: rgba(56, 189, 248, 0.6);
+  border-radius: 10px;
+}
+
+.help-doc-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(56, 189, 248, 0.8);
+}
+
+.help-doc {
+  min-width: 0;
+  line-height: 1.55;
+}
+
+.help-lead {
+  margin-top: 0;
+  color: #475569;
+}
+
+body.theme-dark .help-lead {
+  color: rgba(226, 232, 240, 0.88);
+}
+
+.help-doc h3 {
+  margin-top: 18px;
+  margin-bottom: 8px;
+}
+
+.help-doc ul,
+.help-doc ol {
+  margin-top: 8px;
+  margin-bottom: 0;
+}
+
+.help-doc li {
+  margin: 6px 0;
+}
+
+.help-kv {
+  display: grid;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.help-kv-row {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 12px;
+  background: rgba(248, 250, 252, 0.55);
+}
+
+body.theme-dark .help-kv-row {
+  background: rgba(15, 23, 42, 0.35);
+  border-color: rgba(148, 163, 184, 0.22);
+}
+
+.help-kv-key {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: #64748b;
+  align-self: start;
+  padding-top: 2px;
+}
+
+body.theme-dark .help-kv-key {
+  color: rgba(226, 232, 240, 0.72);
+}
+
+.help-kv-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.help-footnote {
+  margin-top: 14px;
+  color: #475569;
+}
+
+body.theme-dark .help-footnote {
+  color: rgba(226, 232, 240, 0.82);
+}
+
 
 @media (max-width: 900px) {
   .home-hero {

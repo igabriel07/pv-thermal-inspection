@@ -1,6 +1,8 @@
 import base64
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import tempfile
@@ -74,7 +76,38 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     def health():
-        return {"status": "ok", "message": "FastAPI backend is running."}
+        versions: Dict[str, str] = {
+            "python": sys.version.split()[0],
+        }
+
+        try:
+            import fastapi
+
+            v = getattr(fastapi, "__version__", "")
+            if isinstance(v, str) and v:
+                versions["fastapi"] = v
+        except Exception:
+            pass
+
+        for name, mod in (
+            ("numpy", np),
+            ("opencv", cv2),
+            ("torch", torch),
+        ):
+            v = getattr(mod, "__version__", "")
+            if isinstance(v, str) and v:
+                versions[name] = v
+
+        try:
+            import ultralytics
+
+            v = getattr(ultralytics, "__version__", "")
+            if isinstance(v, str) and v:
+                versions["ultralytics"] = v
+        except Exception:
+            pass
+
+        return {"status": "ok", "message": "FastAPI backend is running.", "versions": versions}
 
     @app.on_event("startup")
     def load_model_on_startup():
@@ -225,6 +258,124 @@ def create_app() -> FastAPI:
         except Exception as exc:
             print(f"[ERROR] Metadata probe failed: {exc}")
             raise HTTPException(status_code=500, detail=str(exc))
+
+    def _find_soffice_executable() -> str | None:
+        """Return the path to LibreOffice's `soffice` executable, or None if not found."""
+
+        # Allow explicit configuration.
+        for env_name in ("SOFFICE_PATH", "LIBREOFFICE_PATH"):
+            value = os.getenv(env_name)
+            if not value:
+                continue
+            value = value.strip().strip('"')
+            if not value:
+                continue
+            p = Path(value)
+
+            # Accept either the full path to soffice(.exe) or a LibreOffice install folder.
+            if p.is_dir():
+                candidate = p / "program" / ("soffice.exe" if os.name == "nt" else "soffice")
+                if candidate.exists():
+                    return str(candidate)
+            elif p.exists():
+                return str(p)
+
+        # PATH lookup.
+        for name in ("soffice", "soffice.exe"):
+            found = shutil.which(name)
+            if found:
+                return found
+
+        # Common Windows install locations.
+        if os.name == "nt":
+            common = [
+                Path("C:/Program Files/LibreOffice/program/soffice.exe"),
+                Path("C:/Program Files (x86)/LibreOffice/program/soffice.exe"),
+            ]
+            for c in common:
+                if c.exists():
+                    return str(c)
+
+        return None
+
+    def _convert_docx_bytes_to_pdf_bytes(docx_bytes: bytes, soffice_path: str, timeout_s: int = 90) -> bytes:
+        """Convert DOCX bytes to PDF bytes using LibreOffice headless."""
+        with tempfile.TemporaryDirectory(prefix="docx2pdf-") as tmpdir:
+            tmp = Path(tmpdir)
+            in_path = tmp / "input.docx"
+            out_path = tmp / "input.pdf"
+
+            in_path.write_bytes(docx_bytes)
+
+            cmd = [
+                soffice_path,
+                "--headless",
+                "--nologo",
+                "--nolockcheck",
+                "--norestore",
+                "--invisible",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(tmp),
+                str(in_path),
+            ]
+
+            proc = subprocess.run(
+                cmd,
+                cwd=str(tmp),
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+
+            if proc.returncode != 0 or not out_path.exists():
+                stdout = (proc.stdout or "").strip()
+                stderr = (proc.stderr or "").strip()
+                msg = "LibreOffice conversion failed."
+                if stderr:
+                    msg += f" stderr: {stderr[:2000]}"
+                elif stdout:
+                    msg += f" stdout: {stdout[:2000]}"
+                raise RuntimeError(msg)
+
+            return out_path.read_bytes()
+
+    @app.post("/api/convert/docx-to-pdf")
+    async def convert_docx_to_pdf(file: UploadFile = File(...)):
+        """Convert an uploaded .docx file to PDF using LibreOffice headless."""
+
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        filename = (file.filename or "").strip() or "report.docx"
+        if not filename.lower().endswith(".docx"):
+            raise HTTPException(status_code=400, detail="File must be .docx")
+
+        # Soft limit to avoid accidental huge uploads.
+        if len(raw) > 25 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="File too large")
+
+        soffice = _find_soffice_executable()
+        if not soffice:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "LibreOffice (soffice) not found. Install LibreOffice, or set SOFFICE_PATH / LIBREOFFICE_PATH. "
+                    "Example SOFFICE_PATH on Windows: C:/Program Files/LibreOffice/program/soffice.exe"
+                ),
+            )
+
+        try:
+            pdf_bytes = await run_in_threadpool(_convert_docx_bytes_to_pdf_bytes, raw, soffice)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=504, detail="LibreOffice conversion timed out")
+        except Exception as exc:
+            print(f"[ERROR] DOCX->PDF conversion failed: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        return Response(content=pdf_bytes, media_type="application/pdf")
 
     async def _read_uploaded_tiff_to_tmp_path(file: UploadFile) -> tuple[str, str]:
         raw = await file.read()

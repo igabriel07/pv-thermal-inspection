@@ -27,14 +27,10 @@ import {
   TextWrappingType,
   TextRun,
   VerticalAlignTable,
-  VerticalPositionAlign,
   VerticalPositionRelativeFrom,
   WidthType,
   convertInchesToTwip,
 } from 'docx'
-import { renderAsync } from 'docx-preview'
-import html2canvas from 'html2canvas'
-import { jsPDF } from 'jspdf'
 import './App.css'
 
 type DraftTextInputProps = {
@@ -527,8 +523,13 @@ function App() {
   const [activeMenu, setActiveMenu] = useState('file')
   const [activeAction, setActiveAction] = useState<'view' | 'scan' | 'report' | ''>('')
   const [openMenu, setOpenMenu] = useState<string>('')
+  const [activeHelpPage, setActiveHelpPage] = useState<'documentation' | 'about'>('documentation')
+  const [helpLang, setHelpLang] = useState<'en' | 'el'>('en')
+  const [backendHealth, setBackendHealth] = useState<{ status?: string; message?: string; versions?: Record<string, string> } | null>(null)
+  const [backendHealthError, setBackendHealthError] = useState<string>('')
   const [fileTree, setFileTree] = useState<TreeNode | null>(null)
   const [fileMap, setFileMap] = useState<Record<string, File>>({})
+  const [workspaceIndexTick, setWorkspaceIndexTick] = useState(0)
   // `selectedPath` is the *context* path (thermal) used for labels/metadata.
   const [selectedPath, setSelectedPath] = useState<string>('')
   // `selectedViewPath` is the *display* path (thermal or rgb) shown in the View.
@@ -589,6 +590,7 @@ function App() {
   const [onlyCenterBoxFaults, setOnlyCenterBoxFaults] = useState(false)
   const [starredFaults, setStarredFaults] = useState<Record<string, true>>({})
   const [onlyStarredInReport, setOnlyStarredInReport] = useState(false)
+  const [reportAdvancedOpen, setReportAdvancedOpen] = useState(false)
   const [reportText, setReportText] = useState('')
   const [reportStatus, setReportStatus] = useState<string>('')
   const [reportError, setReportError] = useState<string>('')
@@ -645,8 +647,22 @@ function App() {
   const viewerHostRef = useRef<HTMLDivElement | null>(null)
   const docxPreviewHostRef = useRef<HTMLDivElement | null>(null)
   const docxPreviewStylesRef = useRef<HTMLDivElement | null>(null)
+  const docxPreviewPdfUrlRef = useRef<string | null>(null)
+  const docxPreviewPdfBlobRef = useRef<Blob | null>(null)
+  const docxPreviewLastErrorRef = useRef<string>('')
   const reportSplitRef = useRef<HTMLDivElement | null>(null)
   const selectedLabelsRef = useRef(selectedLabels)
+  const workspaceIndexSignatureRef = useRef<string>('')
+  const workspacePollInFlightRef = useRef<Promise<void> | null>(null)
+
+  useEffect(() => {
+    return () => {
+      const url = docxPreviewPdfUrlRef.current
+      if (url) URL.revokeObjectURL(url)
+      docxPreviewPdfUrlRef.current = null
+      docxPreviewPdfBlobRef.current = null
+    }
+  }, [])
   type RgbWorkingLabelsCache = {
     labels: Array<{ classId: number; x: number; y: number; w: number; h: number; conf: number; shape?: 'rect' | 'ellipse'; source?: 'auto' | 'manual' }>
     areImageSpace: boolean
@@ -663,6 +679,7 @@ function App() {
   const [explorerContextMenu, setExplorerContextMenu] = useState<null | { x: number; y: number; node: TreeNode; source: 'tree' | 'faultsList' }>(null)
   const centerFlagsEnsureInFlightRef = useRef<Promise<Record<string, 0 | 1>> | null>(null)
   const reportResyncTimerRef = useRef<number | null>(null)
+  const reportDefaultStarredAppliedRef = useRef(false)
   const reportResyncPendingRef = useRef<
     | null
     | {
@@ -1063,11 +1080,15 @@ function App() {
   const loadWideTempsGridFromDisk = async (csvName: string): Promise<WideTempsGrid | null> => {
     if (!folderHandle || !folderHandle.getDirectoryHandle) return null
     try {
-      const faultsDir = await getWorkflowFaultsDir(false)
-      if (!faultsDir || !faultsDir.getDirectoryHandle) return null
-      const tempsDir = await faultsDir.getDirectoryHandle('temperatures_csvs', { create: false })
-      const text = await readTextFile(tempsDir, csvName)
-      if (!text) return null
+      const tempsDir = await getWorkspaceThermalTemperaturesCsvsDir(false)
+      const text = tempsDir ? await readTextFile(tempsDir, csvName) : null
+      if (!text) {
+        const legacyFaultsDir = await getLegacyWorkflowFaultsDir(false)
+        const legacyTempsDir = legacyFaultsDir?.getDirectoryHandle ? await legacyFaultsDir.getDirectoryHandle('temperatures_csvs', { create: false }) : null
+        const legacyText = legacyTempsDir ? await readTextFile(legacyTempsDir, csvName) : null
+        if (!legacyText) return null
+        return parseWideTempsCsv(legacyText)
+      }
       return parseWideTempsCsv(text)
     } catch {
       return null
@@ -1167,10 +1188,51 @@ function App() {
   }, [activeAction, fileKind, selectedPath])
 
   useEffect(() => {
-    fetch(apiUrl('/api/health'))
+    const controller = new AbortController()
+
+    fetch(apiUrl('/api/health'), { signal: controller.signal })
       .then((res) => res.json())
-      .then((data) => setMessage(typeof data?.message === 'string' ? data.message : 'Backend is running.'))
-      .catch(() => setMessage('Backend unavailable. Start FastAPI.'))
+      .then((data) => {
+        setBackendHealth(data)
+        setBackendHealthError('')
+        setMessage(typeof data?.message === 'string' ? data.message : 'Backend is running.')
+      })
+      .catch((err) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return
+        setBackendHealth(null)
+        setBackendHealthError('Backend unavailable. Start FastAPI.')
+        setMessage('Backend unavailable. Start FastAPI.')
+      })
+
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    if (activeMenu !== 'help' || activeHelpPage !== 'about') return
+
+    const controller = new AbortController()
+    fetch(apiUrl('/api/health'), { signal: controller.signal })
+      .then((res) => res.json())
+      .then((data) => {
+        setBackendHealth(data)
+        setBackendHealthError('')
+      })
+      .catch((err) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return
+        setBackendHealth(null)
+        setBackendHealthError('Backend unavailable. Start FastAPI.')
+      })
+
+    return () => controller.abort()
+  }, [activeMenu, activeHelpPage])
+
+  const buildTimeLocal = useMemo(() => {
+    try {
+      const d = new Date(__BUILD_TIME__)
+      return Number.isFinite(d.getTime()) ? d.toLocaleString() : __BUILD_TIME__
+    } catch {
+      return __BUILD_TIME__
+    }
   }, [])
 
   useEffect(() => {
@@ -1282,6 +1344,14 @@ function App() {
     loadCenterFaultFlags().catch(() => undefined)
     loadStarredFaults().catch(() => undefined)
   }, [activeAction, folderHandle])
+
+  useEffect(() => {
+    if (activeAction !== 'report') return
+    if (reportDefaultStarredAppliedRef.current) return
+    reportDefaultStarredAppliedRef.current = true
+    handleToggleOnlyStarredInReport(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeAction])
 
   useEffect(() => {
     if (!selectedPath) {
@@ -1544,6 +1614,21 @@ function App() {
     return { prefix, variant, ext }
   }
 
+  const getTocImageToken = (path: string) => {
+    const base = (path.split('/').pop() || path).trim()
+    if (!base) return ''
+
+    const parsed = parseDjiTvVariant(base)
+    if (parsed) {
+      const token = (parsed.prefix.split('_').pop() || '').trim()
+      if (token) return token
+    }
+
+    const noExt = base.replace(/\.[^.]+$/, '')
+    const lastUnderscoreToken = (noExt.split('_').pop() || '').trim()
+    return lastUnderscoreToken || noExt || base
+  }
+
   // Returns a key used to pair Thermal<->RGB images even when the HHMMSS part differs.
   // Example: DJI_20250310134913_0018_T.JPG and DJI_20250310134912_0018_V.JPG
   // both map to: DJI_20250310_0018
@@ -1563,12 +1648,32 @@ function App() {
     return Number.isFinite(ts) ? ts : null
   }
 
-  const normalizePath = (path: string) => path.replace(/\\/g, '/').replace(/^\/+/, '')
+  const normalizePath = (path: string) =>
+    path
+      .replace(/\\/g, '/')
+      .replace(/^\.\/+/, '')
+      .replace(/^\/+/, '')
+      .replace(/\/\.\//g, '/')
 
   const filePathByLowerCase = useMemo(() => {
     const out: Record<string, string> = {}
     for (const p of Object.keys(fileMap)) {
       out[p.toLowerCase()] = p
+    }
+    return out
+  }, [fileMap])
+
+  const dirPathLowerSet = useMemo(() => {
+    const out = new Set<string>()
+    const paths = Object.keys(fileMap)
+    for (const p of paths) {
+      const parts = p.split('/').filter(Boolean)
+      if (parts.length <= 1) continue
+      let acc = ''
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        acc = acc ? `${acc}/${parts[i]}` : parts[i]
+        out.add(acc.toLowerCase())
+      }
     }
     return out
   }, [fileMap])
@@ -1678,10 +1783,10 @@ function App() {
     const normalized = normalizePath(rawPath.trim())
     if (!normalized) return ''
     if (fileMap[normalized]) return normalized
-    if (thermalFolderPath) {
-      const candidate = normalized.startsWith(`${thermalFolderPath}/`)
+    if (effectiveThermalFolderPath) {
+      const candidate = normalized.startsWith(`${effectiveThermalFolderPath}/`)
         ? normalized
-        : `${thermalFolderPath}/${normalized}`
+        : `${effectiveThermalFolderPath}/${normalized}`
       if (fileMap[candidate]) return candidate
     }
     return normalized
@@ -1690,15 +1795,63 @@ function App() {
   const findFolderPathByName = (targetName: string) => {
     if (!fileTree?.children?.length) return null
     const target = targetName.toLowerCase()
+
+    // Collect *all* matches first (do not return early). The file tree traversal order
+    // can cause a nested folder (e.g. `tiff/thermal`) to be encountered before the
+    // intended top-level `thermal/`.
+    const matches: string[] = []
     const stack: TreeNode[] = [...fileTree.children]
     while (stack.length > 0) {
       const node = stack.shift()!
-      if (node.type === 'folder' && node.name.toLowerCase() === target) {
-        return node.path
+      if (node.type === 'folder') {
+        if (node.name.toLowerCase() === target) matches.push(node.path)
+        if (node.children && node.children.length > 0) {
+          stack.unshift(...node.children)
+        }
       }
-      if (node.type === 'folder' && node.children && node.children.length > 0) {
-        stack.unshift(...node.children)
+    }
+    if (matches.length === 0) return null
+
+    const parentOf = (p: string) => getParentDirPath(p) || ''
+    const depthOf = (p: string) => p.split('/').filter(Boolean).length
+    const hasSibling = (parent: string, name: string) => {
+      const sib = parent ? `${parent}/${name}` : name
+      return dirPathLowerSet.has(sib.toLowerCase())
+    }
+
+    const score = (candidate: string) => {
+      const parent = parentOf(candidate)
+      let s = 0
+      // Prefer top-level matches.
+      if (!parent) s += 2
+      // Prefer the folder whose parent also contains the expected siblings.
+      // This matches your contract: root contains rgb/, thermal/, tiff/.
+      if (target === 'thermal') {
+        if (hasSibling(parent, 'rgb')) s += 10
+        if (hasSibling(parent, 'tiff') || hasSibling(parent, 'tif')) s += 5
+        if (hasSibling(parent, 'workspace')) s += 1
+      } else if (target === 'rgb') {
+        if (hasSibling(parent, 'thermal')) s += 10
+        if (hasSibling(parent, 'tiff') || hasSibling(parent, 'tif')) s += 5
+        if (hasSibling(parent, 'workspace')) s += 1
       }
+      return s
+    }
+
+    // Highest score wins; tie-breaker: shallowest path.
+    const sorted = matches
+      .slice()
+      .sort((a, b) => (score(b) - score(a)) || (depthOf(a) - depthOf(b)) || a.localeCompare(b))
+    return sorted[0] || null
+  }
+
+  const inferFolderPathFromFileMap = (targetName: 'thermal' | 'rgb') => {
+    const target = targetName.toLowerCase()
+    const paths = Object.keys(fileMap)
+    for (const path of paths) {
+      const parts = path.split('/').filter(Boolean)
+      const idx = parts.findIndex((p) => p.toLowerCase() === target)
+      if (idx >= 0) return parts.slice(0, idx + 1).join('/')
     }
     return null
   }
@@ -1706,54 +1859,47 @@ function App() {
   const thermalFolderPath = useMemo(() => findFolderPathByName('thermal'), [fileTree])
   const rgbFolderPath = useMemo(() => findFolderPathByName('rgb'), [fileTree])
 
+  // Use fileTree detection when available; fall back to fileMap inference so actions
+  // like Scan don't fail if the tree hasn't populated yet.
+  const effectiveThermalFolderPath = useMemo(
+    () => thermalFolderPath ?? inferFolderPathFromFileMap('thermal'),
+    [fileMap, thermalFolderPath]
+  )
+  const effectiveRgbFolderPath = useMemo(
+    () => rgbFolderPath ?? inferFolderPathFromFileMap('rgb'),
+    [fileMap, rgbFolderPath]
+  )
+
+  const openedFolderNameLower = (folderHandle?.name || '').toLowerCase()
+  const openedThermalFolderDirectly = openedFolderNameLower === 'thermal' && !effectiveThermalFolderPath
+  const openedRgbFolderDirectly = openedFolderNameLower === 'rgb' && !effectiveRgbFolderPath
+
   useEffect(() => {
     // New folder opened/restored → allow one-time ensure.
     setRgbLabelsDirEnsuredOnOpen(false)
   }, [folderHandle])
 
   useEffect(() => {
-    // On first folder open, ensure `rgb/labels` exists (if an rgb folder exists), without re-prompting.
+    // On first folder open, ensure `workspace/rgb_labels` exists (if an rgb folder exists), without re-prompting.
     if (!folderHandle || rgbLabelsDirEnsuredOnOpen) return
     const rootHandle = folderHandle
-    const getRootDir = rootHandle.getDirectoryHandle?.bind(rootHandle)
-    if (!getRootDir) {
-      setRgbLabelsDirEnsuredOnOpen(true)
-      return
-    }
 
     let cancelled = false
     void (async () => {
       try {
+        // If we can't locate `thermal/` within the opened folder, we don't know where
+        // to place the sibling `workspace/` folder.
+        if (!effectiveThermalFolderPath) return
+
         // Don't trigger extra permission prompts here — only create if we already have write permission.
         const canWrite = await hasWritePermission(rootHandle)
         if (!canWrite) return
 
-        // Find the rgb folder.
-        let rgbDir: FileSystemDirectoryHandle | null = null
-        if (rgbFolderPath) {
-          const parts = rgbFolderPath.split('/').filter(Boolean)
-          let dir: FileSystemDirectoryHandle = rootHandle
-          for (const part of parts) {
-            if (!dir.getDirectoryHandle) return
-            dir = await dir.getDirectoryHandle(part, { create: false })
-          }
-          rgbDir = dir
-        } else {
-          try {
-            rgbDir = await getRootDir('rgb', { create: false })
-          } catch {
-            rgbDir = null
-          }
-        }
+        // Only ensure when an rgb folder exists in the opened tree.
+        if (!effectiveRgbFolderPath) return
 
-        if (!rgbDir || !rgbDir.getDirectoryHandle) return
-
-        // Ensure labels folder.
-        try {
-          await rgbDir.getDirectoryHandle('labels', { create: false })
-        } catch {
-          await rgbDir.getDirectoryHandle('labels', { create: true })
-        }
+        // Ensure `workspace/rgb_labels`.
+        await getWorkspaceRgbLabelsDir(true)
       } finally {
         if (!cancelled) setRgbLabelsDirEnsuredOnOpen(true)
       }
@@ -1762,7 +1908,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [folderHandle, rgbFolderPath, rgbLabelsDirEnsuredOnOpen])
+  }, [effectiveRgbFolderPath, effectiveThermalFolderPath, folderHandle, rgbLabelsDirEnsuredOnOpen])
 
   const getRgbPathForThermal = (thermalPath: string) => {
     const name = thermalPath.split('/').pop() || ''
@@ -1785,12 +1931,12 @@ function App() {
       variants.flatMap((v) => exts.map((ext) => `${parsed.prefix}_${v}${ext}`))
     )
 
-    if (thermalFolderPath && rgbFolderPath && thermalPath.startsWith(`${thermalFolderPath}/`)) {
-      const rest = thermalPath.slice(thermalFolderPath.length + 1)
+    if (effectiveThermalFolderPath && effectiveRgbFolderPath && thermalPath.startsWith(`${effectiveThermalFolderPath}/`)) {
+      const rest = thermalPath.slice(effectiveThermalFolderPath.length + 1)
       const restParts = rest.split('/').filter(Boolean)
       restParts.pop()
       const subdir = restParts.join('/')
-      const baseDir = `${rgbFolderPath}${subdir ? `/${subdir}` : ''}`
+      const baseDir = `${effectiveRgbFolderPath}${subdir ? `/${subdir}` : ''}`
       for (const candidateName of candidates) {
         const resolved = resolvePathCaseInsensitive(`${baseDir}/${candidateName}`)
         if (resolved) return resolved
@@ -1838,12 +1984,12 @@ function App() {
       variants.flatMap((v) => exts.map((ext) => `${parsed.prefix}_${v}${ext}`))
     )
 
-    if (thermalFolderPath && rgbFolderPath && rgbPath.startsWith(`${rgbFolderPath}/`)) {
-      const rest = rgbPath.slice(rgbFolderPath.length + 1)
+    if (effectiveThermalFolderPath && effectiveRgbFolderPath && rgbPath.startsWith(`${effectiveRgbFolderPath}/`)) {
+      const rest = rgbPath.slice(effectiveRgbFolderPath.length + 1)
       const restParts = rest.split('/').filter(Boolean)
       restParts.pop()
       const subdir = restParts.join('/')
-      const baseDir = `${thermalFolderPath}${subdir ? `/${subdir}` : ''}`
+      const baseDir = `${effectiveThermalFolderPath}${subdir ? `/${subdir}` : ''}`
       for (const candidateName of candidates) {
         const resolved = resolvePathCaseInsensitive(`${baseDir}/${candidateName}`)
         if (resolved) return resolved
@@ -1877,8 +2023,8 @@ function App() {
   }
 
   const isInThermalFolder = (path: string) => {
-    if (!thermalFolderPath) return true
-    return path === thermalFolderPath || path.startsWith(`${thermalFolderPath}/`)
+    if (!effectiveThermalFolderPath) return true
+    return path === effectiveThermalFolderPath || path.startsWith(`${effectiveThermalFolderPath}/`)
   }
 
   const getParentDirPath = (path: string) => {
@@ -1886,6 +2032,14 @@ function App() {
     parts.pop()
     return parts.join('/')
   }
+
+  const WORKSPACE_DIR = 'workspace'
+  const WORKSPACE_THERMAL_FAULTS_DIR = 'thermal_faults'
+  const WORKSPACE_THERMAL_LABELS_DIR = 'thermal_labels'
+  const WORKSPACE_THERMAL_LABELS_CENTER_DIR = 'thermal_labels_center'
+  const WORKSPACE_THERMAL_METADATA_DIR = 'thermal_metadata'
+  const WORKSPACE_THERMAL_TEMPS_CSV_DIR = 'thermal_temperatures_csvs'
+  const WORKSPACE_RGB_LABELS_DIR = 'rgb_labels'
 
   const [navScope, setNavScope] = useState<'tree' | 'faultsList' | null>(null)
 
@@ -2017,11 +2171,132 @@ function App() {
     return handle.getDirectoryHandle('faults', { create })
   }
 
+  const getWorkspaceProjectRootDir = async (create: boolean) => {
+    if (!folderHandle) return null
+    if (!folderHandle.getDirectoryHandle) return null
+
+    // If the user opened the `thermal/` (or `rgb/`) folder directly, we cannot create
+    // a sibling `workspace/` folder because we don't have access to the parent.
+    if (openedThermalFolderDirectly || openedRgbFolderDirectly) return null
+
+    // If we can't detect a thermal folder path yet (e.g. tree not populated), assume
+    // the opened folder is the project root.
+    if (!effectiveThermalFolderPath) return folderHandle
+
+    const projectRootPath = getParentDirPath(effectiveThermalFolderPath)
+    const parts = projectRootPath ? projectRootPath.split('/').filter(Boolean) : []
+    let dir: FileSystemDirectoryHandle = folderHandle
+    for (const part of parts) {
+      if (!dir.getDirectoryHandle) return null
+      dir = await dir.getDirectoryHandle(part, { create })
+    }
+    return dir
+  }
+
+  const getWorkspaceRootDir = async (create: boolean) => {
+    const projectRoot = await getWorkspaceProjectRootDir(create)
+    if (!projectRoot) return null
+    if (!projectRoot.getDirectoryHandle) return null
+    return projectRoot.getDirectoryHandle(WORKSPACE_DIR, { create })
+  }
+
+  const getWorkspaceSubdir = async (name: string, create: boolean) => {
+    const workspaceRoot = await getWorkspaceRootDir(create)
+    if (!workspaceRoot) return null
+    if (!workspaceRoot.getDirectoryHandle) return null
+    return workspaceRoot.getDirectoryHandle(name, { create })
+  }
+
+  // Resolve `workspace/<subdir>` for a specific file path.
+  // This makes reads/writes stable even when the opened folder contains multiple sessions
+  // (e.g. `data/<uuid>/thermal/...`), by anchoring `workspace/` next to that session's `thermal/`.
+  const getWorkspaceSubdirForPath = async (targetPath: string, name: string, create: boolean) => {
+    if (!folderHandle) return null
+    if (!folderHandle.getDirectoryHandle) return null
+
+    const normalizedTarget = normalizePath(String(targetPath || ''))
+
+    const parts = normalizedTarget.split('/').filter(Boolean)
+    const thermalIdx = parts.findIndex((p) => p.toLowerCase() === 'thermal')
+    let projectRootParts = thermalIdx >= 0 ? parts.slice(0, thermalIdx) : []
+
+    // If `targetPath` looks like it's rooted at `thermal/...` but the detected thermal folder is
+    // nested (e.g. `thermal1_images/thermal/...`), infer the missing prefix from the detection.
+    if (thermalIdx === 0 && effectiveThermalFolderPath) {
+      const effParts = effectiveThermalFolderPath.split('/').filter(Boolean)
+      const effThermalIdx = effParts.findIndex((p) => p.toLowerCase() === 'thermal')
+      if (effThermalIdx > 0) {
+        projectRootParts = effParts.slice(0, effThermalIdx)
+      }
+    }
+
+    let projectRoot: FileSystemDirectoryHandle = folderHandle
+    for (const part of projectRootParts) {
+      if (!projectRoot.getDirectoryHandle) return null
+      projectRoot = await projectRoot.getDirectoryHandle(part, { create })
+    }
+
+    if (!projectRoot.getDirectoryHandle) return null
+    // Prefer the workspace folder next to the session's `thermal/`.
+    try {
+      const ws = await projectRoot.getDirectoryHandle(WORKSPACE_DIR, { create })
+      if (ws?.getDirectoryHandle) {
+        return ws.getDirectoryHandle(name, { create })
+      }
+    } catch {
+      // ignore and fall back for reads
+    }
+
+    // Fallback for reads: if `workspace/` exists at the opened root, use it.
+    // This supports older layouts where the user opened the session root directly.
+    if (!create) {
+      try {
+        const wsAtRoot = await folderHandle.getDirectoryHandle(WORKSPACE_DIR, { create: false })
+        if (wsAtRoot?.getDirectoryHandle) {
+          const hit = await wsAtRoot.getDirectoryHandle(name, { create: false })
+          if (hit) return hit
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    return null
+  }
+
+  const getWorkspaceThermalLabelsDirForPath = async (targetPath: string, create: boolean) =>
+    getWorkspaceSubdirForPath(targetPath, WORKSPACE_THERMAL_LABELS_DIR, create)
+  const getWorkspaceThermalLabelsCenterDirForPath = async (targetPath: string, create: boolean) =>
+    getWorkspaceSubdirForPath(targetPath, WORKSPACE_THERMAL_LABELS_CENTER_DIR, create)
+  const getWorkspaceThermalFaultsDirForPath = async (targetPath: string, create: boolean) =>
+    getWorkspaceSubdirForPath(targetPath, WORKSPACE_THERMAL_FAULTS_DIR, create)
+
+  const getWorkspaceThermalFaultsDir = async (create: boolean) => getWorkspaceSubdir(WORKSPACE_THERMAL_FAULTS_DIR, create)
+  const getWorkspaceThermalLabelsDir = async (create: boolean) => getWorkspaceSubdir(WORKSPACE_THERMAL_LABELS_DIR, create)
+  const getWorkspaceThermalLabelsCenterDir = async (create: boolean) => getWorkspaceSubdir(WORKSPACE_THERMAL_LABELS_CENTER_DIR, create)
+  const getWorkspaceThermalMetadataDir = async (create: boolean) => getWorkspaceSubdir(WORKSPACE_THERMAL_METADATA_DIR, create)
+  const getWorkspaceThermalTemperaturesCsvsDir = async (create: boolean) => getWorkspaceSubdir(WORKSPACE_THERMAL_TEMPS_CSV_DIR, create)
+  const getWorkspaceRgbLabelsDir = async (create: boolean) => getWorkspaceSubdir(WORKSPACE_RGB_LABELS_DIR, create)
+
+  const getLegacyWorkflowFaultsDir = async (create: boolean) => {
+    const root = await getWorkflowRootDir(create)
+    if (!root) return null
+    return getFaultsDir(root, create)
+  }
+
+  const getLegacyRgbLabelsDir = async (create: boolean) => {
+    const root = await getRgbRootDir(create)
+    if (!root) return null
+    if (!root.getDirectoryHandle) return null
+    return root.getDirectoryHandle('labels', { create })
+  }
+
   const getWorkflowRootDir = async (create: boolean) => {
     if (!folderHandle) return null
-    if (!thermalFolderPath) return folderHandle
+    const baseThermalPath = effectiveThermalFolderPath
+    if (!baseThermalPath) return folderHandle
     if (!folderHandle.getDirectoryHandle) return null
-    const parts = thermalFolderPath.split('/').filter(Boolean)
+    const parts = baseThermalPath.split('/').filter(Boolean)
     let dir: FileSystemDirectoryHandle = folderHandle
     for (const part of parts) {
       if (!dir.getDirectoryHandle) return null
@@ -2036,7 +2311,7 @@ function App() {
     // Fallback: derive the parent folder from the currently viewed RGB image path.
     const fallbackRgbPath =
       viewVariant === 'rgb' && selectedViewPath ? selectedViewPath.split('/').slice(0, -1).join('/') : ''
-    const basePath = rgbFolderPath || fallbackRgbPath
+    const basePath = effectiveRgbFolderPath || fallbackRgbPath
     if (!basePath) return folderHandle
     if (!folderHandle.getDirectoryHandle) return null
     const parts = basePath.split('/').filter(Boolean)
@@ -2049,29 +2324,19 @@ function App() {
   }
 
   const getRgbLabelsDir = async (create: boolean) => {
-    const root = await getRgbRootDir(create)
-    if (!root) return null
-    if (!root.getDirectoryHandle) return null
-    return root.getDirectoryHandle('labels', { create })
+    return getWorkspaceRgbLabelsDir(create)
   }
 
-  // Ensures `rgb/labels` exists. If it doesn't exist, creates it.
+  // Ensures `workspace/rgb_labels` exists. If it doesn't exist, creates it.
   const ensureRgbLabelsDir = async () => {
-    const root = await getRgbRootDir(true)
+    const root = await getRgbLabelsDir(true)
     if (!root) return null
     if (!root.getDirectoryHandle) return null
-
-    try {
-      return await root.getDirectoryHandle('labels', { create: false })
-    } catch {
-      return await root.getDirectoryHandle('labels', { create: true })
-    }
+    return root
   }
 
   const getWorkflowFaultsDir = async (create: boolean) => {
-    const root = await getWorkflowRootDir(create)
-    if (!root) return null
-    return getFaultsDir(root, create)
+    return getWorkspaceThermalFaultsDir(create)
   }
 
   const readTextFile = async (dir: FileSystemDirectoryHandle, name: string) => {
@@ -2085,6 +2350,209 @@ function App() {
     }
   }
 
+  const parseYoloNumber = (raw: unknown) => {
+    const s = String(raw ?? '')
+      .replace(/^\uFEFF/, '')
+      .trim()
+    if (!s) return NaN
+    // Some datasets use comma as decimal separator (e.g. "0,123").
+    // Prefer interpreting comma as decimal when there's no dot present.
+    if (s.includes(',') && !s.includes('.')) {
+      if (/^-?\d+,\d+$/.test(s)) return Number(s.replace(',', '.'))
+      if (/^-?\d{1,3}(,\d{3})+$/.test(s)) return Number(s.replace(/,/g, ''))
+      return Number(s.replace(',', '.'))
+    }
+    return Number(s)
+  }
+
+  const inferSessionPrefixFromThermalDetection = () => {
+    if (!effectiveThermalFolderPath) return ''
+    const effParts = effectiveThermalFolderPath.split('/').filter(Boolean)
+    const effThermalIdx = effParts.findIndex((p) => p.toLowerCase() === 'thermal')
+    if (effThermalIdx > 0) return effParts.slice(0, effThermalIdx).join('/')
+    return ''
+  }
+
+  // Lightweight realtime monitoring: poll only the relevant workspace folder(s) and
+  // merge them into `fileMap` so label existence checks + reads stay current.
+  useEffect(() => {
+    if (!folderHandle) return
+    if (openedThermalFolderDirectly || openedRgbFolderDirectly) return
+
+    let cancelled = false
+
+    const pollOnce = async () => {
+      if (cancelled) return
+      if (workspacePollInFlightRef.current) return
+
+      workspacePollInFlightRef.current = (async () => {
+        try {
+          const projectRoot = await getWorkspaceProjectRootDir(false)
+          const getProjectDir = projectRoot?.getDirectoryHandle?.bind(projectRoot)
+          if (!projectRoot || !getProjectDir) return
+
+          const sessionPrefix = inferSessionPrefixFromThermalDetection()
+          const sessionPrefixWithSlash = sessionPrefix ? `${sessionPrefix}/` : ''
+
+          const candidates: Array<{ prefix: string; dir: FileSystemDirectoryHandle }> = []
+          const tryAdd = async (prefix: string, open: () => Promise<FileSystemDirectoryHandle | null>) => {
+            try {
+              const dir = await open()
+              if (dir) candidates.push({ prefix, dir })
+            } catch {
+              // ignore
+            }
+          }
+
+          await tryAdd(`${sessionPrefixWithSlash}${WORKSPACE_DIR}`, async () => {
+            try {
+              return await getProjectDir(WORKSPACE_DIR, { create: false })
+            } catch {
+              return null
+            }
+          })
+
+          // Backward-compat: some older layouts store the workspace under `tif/` or `tiff/`.
+          await tryAdd(`${sessionPrefixWithSlash}tif/${WORKSPACE_DIR}`, async () => {
+            try {
+              const tif = await getProjectDir('tif', { create: false })
+              if (!tif?.getDirectoryHandle) return null
+              return await tif.getDirectoryHandle(WORKSPACE_DIR, { create: false })
+            } catch {
+              return null
+            }
+          })
+
+          await tryAdd(`${sessionPrefixWithSlash}tiff/${WORKSPACE_DIR}`, async () => {
+            try {
+              const tiff = await getProjectDir('tiff', { create: false })
+              if (!tiff?.getDirectoryHandle) return null
+              return await tiff.getDirectoryHandle(WORKSPACE_DIR, { create: false })
+            } catch {
+              return null
+            }
+          })
+
+          if (candidates.length === 0) {
+            if (workspaceIndexSignatureRef.current !== '') {
+              workspaceIndexSignatureRef.current = ''
+              setFileMap((prev) => {
+                const next: Record<string, File> = {}
+                for (const [p, f] of Object.entries(prev)) {
+                  if (p.toLowerCase().includes(`/${WORKSPACE_DIR.toLowerCase()}/`) || p.toLowerCase().startsWith(`${WORKSPACE_DIR.toLowerCase()}/`)) {
+                    continue
+                  }
+                  next[p] = f
+                }
+                return next
+              })
+              setWorkspaceIndexTick((t) => t + 1)
+            }
+            return
+          }
+
+          const workspaceEntries: Array<{ path: string; file: File }> = []
+          for (const { prefix, dir } of candidates) {
+            const entries = await readDirectoryEntries(dir)
+            for (const e of entries) {
+              const fullPath = e.path ? `${prefix}/${e.path}` : prefix
+              workspaceEntries.push({ path: fullPath, file: e.file })
+            }
+          }
+
+          const signature = workspaceEntries
+            .map((e) => `${e.path.toLowerCase()}|${e.file.size}|${e.file.lastModified}`)
+            .sort((a, b) => a.localeCompare(b))
+            .join('\n')
+
+          if (signature === workspaceIndexSignatureRef.current) return
+          workspaceIndexSignatureRef.current = signature
+
+          const prefixes = candidates.map((c) => c.prefix)
+          const prefixesWithSlash = prefixes.map((p) => `${p}/`)
+
+          setFileMap((prev) => {
+            const next: Record<string, File> = {}
+            for (const [p, f] of Object.entries(prev)) {
+              const isUnderWorkspace = prefixes.some((prefix) => p === prefix) || prefixesWithSlash.some((prefix) => p.startsWith(prefix))
+              if (isUnderWorkspace) continue
+              next[p] = f
+            }
+            for (const entry of workspaceEntries) {
+              next[entry.path] = entry.file
+            }
+            return next
+          })
+
+          setWorkspaceIndexTick((t) => t + 1)
+        } finally {
+          workspacePollInFlightRef.current = null
+        }
+      })()
+
+      await workspacePollInFlightRef.current
+    }
+
+    void pollOnce()
+    const id = window.setInterval(() => void pollOnce(), 2000)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [folderHandle, openedThermalFolderDirectly, openedRgbFolderDirectly, effectiveThermalFolderPath])
+
+  const getExpectedThermalLabelPaths = (imagePath: string) => {
+    const normalizedImagePath = normalizePath(String(imagePath || ''))
+    const baseName = normalizedImagePath.split('/').pop() || normalizedImagePath
+    const stem = baseName.replace(/\.[^/.]+$/, '') || baseName
+
+    // Many label exporters omit the trailing `_T` / `_V` in the label filename.
+    // Example image: DJI_..._0011_T.JPG  -> label: DJI_..._0011.txt
+    const stemNoTv = stem.replace(/_[TV]$/i, '')
+
+    const imageParts = normalizedImagePath.split('/').filter(Boolean)
+    const thermalIdx = imageParts.findIndex((p) => p.toLowerCase() === 'thermal')
+    let sessionPrefix = thermalIdx >= 0 ? imageParts.slice(0, thermalIdx).join('/') : ''
+    if ((!sessionPrefix || thermalIdx === 0) && effectiveThermalFolderPath) {
+      sessionPrefix = inferSessionPrefixFromThermalDetection()
+    }
+    const sessionPrefixWithSlash = sessionPrefix ? `${sessionPrefix}/` : ''
+
+    const relUnderThermalDir = thermalIdx >= 0 ? imageParts.slice(thermalIdx + 1, -1).join('/') : ''
+
+    // Support alternate on-disk layouts where `workspace/` lives under `tif/` or `tiff/`.
+    // (Common when TIFF assets are stored in a sibling folder.)
+    const workspaceRoots = [
+      `${sessionPrefixWithSlash}${WORKSPACE_DIR}/${WORKSPACE_THERMAL_LABELS_DIR}`,
+      `${sessionPrefixWithSlash}tif/${WORKSPACE_DIR}/${WORKSPACE_THERMAL_LABELS_DIR}`,
+      `${sessionPrefixWithSlash}tiff/${WORKSPACE_DIR}/${WORKSPACE_THERMAL_LABELS_DIR}`,
+    ]
+
+    const flatCandidates = workspaceRoots.flatMap((root) => [`${root}/${stem}.txt`, stemNoTv && `${root}/${stemNoTv}.txt`].filter(Boolean))
+    const nestedCandidates = relUnderThermalDir
+      ? workspaceRoots.flatMap((root) =>
+          [`${root}/${relUnderThermalDir}/${stem}.txt`, stemNoTv && `${root}/${relUnderThermalDir}/${stemNoTv}.txt`].filter(Boolean)
+        )
+      : []
+
+    const normalizeHit = (p: string) => resolvePathCaseInsensitive(normalizePath(p))
+
+    const flatHit = flatCandidates.map(normalizeHit).find(Boolean) || ''
+    const nestedHit = nestedCandidates.map(normalizeHit).find(Boolean) || ''
+
+    // Prefer showing the first existing path; otherwise default to the canonical location.
+    const flat = (flatHit || flatCandidates[0] || '').trim()
+    const nested = relUnderThermalDir ? (nestedHit || nestedCandidates[0] || '').trim() : ''
+
+    return {
+      flat,
+      nested,
+      flatExists: Boolean(flatHit),
+      nestedExists: Boolean(nestedHit),
+    }
+  }
+
   const parseYoloLabelsText = (text: string) => {
     const lines = String(text || '')
       .split(/\r?\n/)
@@ -2094,12 +2562,12 @@ function App() {
     return lines
       .map((line) => {
         const parts = line.split(/\s+/)
-        const classId = Number(parts[0])
-        const x = Number(parts[1])
-        const y = Number(parts[2])
-        const w = Number(parts[3])
-        const h = Number(parts[4])
-        const conf = parts.length >= 6 ? Number(parts[5]) : 1
+        const classId = parseYoloNumber(parts[0])
+        const x = parseYoloNumber(parts[1])
+        const y = parseYoloNumber(parts[2])
+        const w = parseYoloNumber(parts[3])
+        const h = parseYoloNumber(parts[4])
+        const conf = parts.length >= 6 ? parseYoloNumber(parts[5]) : 1
         return {
           classId: Number.isFinite(classId) ? classId : 0,
           x: Number.isFinite(x) ? x : 0,
@@ -2342,7 +2810,7 @@ function App() {
   }
 
   useEffect(() => {
-    // RGB export: when switching into RGB view, ensure rgb/labels/<stem>.txt exists.
+    // RGB export: when switching into RGB view, ensure workspace/rgb_labels/<stem>.txt exists.
     // Keep track of whether the file is still empty so Save can remain enabled until the
     // first write happens.
     if (viewVariant !== 'rgb' || activeAction !== 'view') {
@@ -2378,7 +2846,7 @@ function App() {
     setRgbLabelsExportDirty(false)
     setRgbLabelsExportStatus('checking')
     ;(async () => {
-      // Try to create rgb/labels and an empty <stem>.txt if missing.
+      // Try to create workspace/rgb_labels and an empty <stem>.txt if missing.
       // If we don't have permission, we'll just fall back to a "missing" state;
       // the Save click will request permission and try again.
       const canWrite = await ensureHandlePermission(folderHandle, 'readwrite')
@@ -2409,7 +2877,25 @@ function App() {
       const outName = `${stem}.txt`
       const fileHandle = await labelsDir.getFileHandle(outName, { create: true })
       const file = await fileHandle.getFile()
-      const text = await file.text()
+      let text = await file.text()
+
+      // If the workspace target is empty but a legacy file exists, migrate it.
+      if (!text.trim()) {
+        const legacyDir = await getLegacyRgbLabelsDir(false)
+        if (legacyDir?.getFileHandle) {
+          try {
+            const legacyHandle = await legacyDir.getFileHandle(outName)
+            const legacyFile = await legacyHandle.getFile()
+            const legacyText = await legacyFile.text()
+            if (legacyText.trim()) {
+              await writeTextFile(labelsDir, outName, legacyText)
+              text = legacyText
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
       if (cancelled) return
       const empty = text.trim().length === 0
       setRgbLabelsExportFileExists(true)
@@ -2442,7 +2928,8 @@ function App() {
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [viewVariant, selectedViewPath, selectedPath, folderHandle, rgbFolderPath, activeAction])
+  }, [viewVariant, selectedViewPath, selectedPath, folderHandle, effectiveRgbFolderPath, activeAction])
+
 
   const readJsonFile = async <T,>(dir: FileSystemDirectoryHandle, name: string): Promise<T | null> => {
     const text = await readTextFile(dir, name)
@@ -2497,13 +2984,30 @@ function App() {
   }
 
   const loadCenterFaultFlags = async () => {
-    const workflowRoot = await getWorkflowRootDir(false)
-    const faultsDir = workflowRoot ? await getFaultsDir(workflowRoot, false) : null
-    if (!faultsDir) {
-      setCenterFaultFlags({})
+    const faultsDir = await getWorkspaceThermalFaultsDir(false)
+    const disk = faultsDir ? await readCenterFlagsDisk(faultsDir) : null
+    if (!disk) {
+      const legacyFaultsDir = await getLegacyWorkflowFaultsDir(false)
+      const legacyDisk = legacyFaultsDir ? await readCenterFlagsDisk(legacyFaultsDir) : null
+      if (!legacyDisk) {
+        setCenterFaultFlags({})
+        return
+      }
+      const flags = legacyDisk.flags
+      if (!flags || Object.keys(flags).length === 0) {
+        setCenterFaultFlags({})
+        return
+      }
+      const resolved: Record<string, 0 | 1> = {}
+      for (const [rawPath, v] of Object.entries(flags)) {
+        const candidate = resolvePathInFileMap(rawPath)
+        if (!candidate) continue
+        resolved[candidate] = v === 1 ? 1 : 0
+      }
+      setCenterFaultFlags(resolved)
       return
     }
-    const disk = await readCenterFlagsDisk(faultsDir)
+
     const flags = disk.flags
     if (!flags || Object.keys(flags).length === 0) {
       setCenterFaultFlags({})
@@ -2519,9 +3023,14 @@ function App() {
   }
 
   const loadStarredFaults = async () => {
-    const workflowRoot = await getWorkflowRootDir(false)
-    const faultsDir = workflowRoot ? await getFaultsDir(workflowRoot, false) : null
-    const text = (faultsDir ? await readTextFile(faultsDir, STARRED_FILE) : null) || (workflowRoot ? await readTextFile(workflowRoot, STARRED_FILE) : null)
+    const workspaceFaultsDir = await getWorkspaceThermalFaultsDir(false)
+    const text = (workspaceFaultsDir ? await readTextFile(workspaceFaultsDir, STARRED_FILE) : null)
+      || (await (async () => {
+        const legacyFaultsDir = await getLegacyWorkflowFaultsDir(false)
+        const workflowRoot = await getWorkflowRootDir(false)
+        return (legacyFaultsDir ? await readTextFile(legacyFaultsDir, STARRED_FILE) : null)
+          || (workflowRoot ? await readTextFile(workflowRoot, STARRED_FILE) : null)
+      })())
     if (!text) {
       setStarredFaults({})
       return
@@ -2542,16 +3051,22 @@ function App() {
     const canWrite = await ensureHandlePermission(folderHandle, 'readwrite')
     if (!canWrite) throw new Error('Write permission is required to save starred images. Reopen the folder and allow write access.')
 
-    const workflowRoot = await getWorkflowRootDir(true)
-    if (!workflowRoot) return
-    const faultsDir = await getFaultsDir(workflowRoot, true)
+    const faultsDir = await getWorkspaceThermalFaultsDir(true)
+    if (!faultsDir) {
+      throw new Error(
+        openedThermalFolderDirectly
+          ? 'You opened the “thermal” folder directly. Open the parent folder that contains “thermal/” so the app can create a sibling “workspace/” folder.'
+          : openedRgbFolderDirectly
+            ? 'You opened the “rgb” folder directly. Open the parent folder that contains “thermal/” (and “rgb/”) so the app can create a sibling “workspace/” folder.'
+            : 'Open the parent folder that contains “thermal/” so the app can create a sibling “workspace/” folder.'
+      )
+    }
     const lines = Object.keys(next)
       .filter((p) => Boolean(fileMap[p]))
       .sort((a, b) => a.localeCompare(b))
       .join('\n')
 
-    if (faultsDir) await writeTextFile(faultsDir, STARRED_FILE, lines)
-    await writeTextFile(workflowRoot, STARRED_FILE, lines)
+    await writeTextFile(faultsDir, STARRED_FILE, lines)
   }
 
   const toggleStarredForPath = (path: string, nextValue?: boolean) => {
@@ -2610,15 +3125,30 @@ function App() {
     options?: { forceRecompute?: boolean }
   ): Promise<Record<string, 0 | 1>> => {
     if (!folderHandle) return { ...centerFaultFlags }
-    const workflowRoot = await getWorkflowRootDir(true)
-    const faultsDir = workflowRoot ? await getFaultsDir(workflowRoot, true) : null
-    if (!faultsDir) return { ...centerFaultFlags }
+    const faultsDir = await getWorkspaceThermalFaultsDir(true)
+    if (!faultsDir) {
+      throw new Error(
+        openedThermalFolderDirectly
+          ? 'You opened the “thermal” folder directly. Open the parent folder that contains “thermal/” so the app can create a sibling “workspace/” folder.'
+          : openedRgbFolderDirectly
+            ? 'You opened the “rgb” folder directly. Open the parent folder that contains “thermal/” (and “rgb/”) so the app can create a sibling “workspace/” folder.'
+            : 'Open the parent folder that contains “thermal/” so the app can create a sibling “workspace/” folder.'
+      )
+    }
 
     const forceRecompute = Boolean(options?.forceRecompute)
 
     // Start from persisted flags if available (most reliable across sessions),
     // unless we explicitly force a recompute (e.g. after changing center box size).
-    const fromDisk = forceRecompute ? null : await readCenterFlagsDisk(faultsDir)
+    const fromDisk = forceRecompute
+      ? null
+      : await (async () => {
+        const ws = await readCenterFlagsDisk(faultsDir)
+        if (ws && Object.keys(ws.flags).length > 0) return ws
+        const legacyFaultsDir = await getLegacyWorkflowFaultsDir(false)
+        const legacy = legacyFaultsDir ? await readCenterFlagsDisk(legacyFaultsDir) : null
+        return legacy && Object.keys(legacy.flags).length > 0 ? legacy : ws
+      })()
     const nextFlags: Record<string, 0 | 1> = {}
     if (fromDisk && Object.keys(fromDisk.flags).length > 0) {
       for (const [rawPath, v] of Object.entries(fromDisk.flags)) {
@@ -2630,26 +3160,32 @@ function App() {
       if (!forceRecompute) Object.assign(nextFlags, centerFaultFlags)
     }
 
-    const labelsDir = await faultsDir.getDirectoryHandle?.('labels', { create: false })
-    const labelsCenterDir = await faultsDir.getDirectoryHandle?.('labels_center', { create: true })
+    const labelsCenterDir = await getWorkspaceThermalLabelsCenterDir(true)
     if (!labelsCenterDir) return nextFlags
+
+    const workspaceLabelsDir = await getWorkspaceThermalLabelsDir(false)
+    const legacyLabelsDir = await (async () => {
+      const legacyFaultsDir = await getLegacyWorkflowFaultsDir(false)
+      return legacyFaultsDir?.getDirectoryHandle ? await legacyFaultsDir.getDirectoryHandle('labels', { create: false }) : null
+    })()
 
     for (const path of paths) {
       if (!forceRecompute && nextFlags[path] !== undefined) continue
       const file = fileMap[path]
-      if (!file || !labelsDir) {
+      const sourceLabelsDir = workspaceLabelsDir || legacyLabelsDir
+      if (!file || !sourceLabelsDir) {
         nextFlags[path] = 0
         continue
       }
 
       const stem = path.split('/').pop()?.replace(/\.[^/.]+$/, '') || path
-      const labelText = (await readTextFile(labelsDir, `${stem}.txt`)) || ''
+      const labelText = (await readTextFile(sourceLabelsDir, `${stem}.txt`)) || ''
       const labels = labelText
         .split(/\r?\n/)
         .map((line) => line.trim())
         .filter(Boolean)
         .map((line) => {
-          const [classId, x, y, w, h, conf] = line.split(/\s+/).map(Number)
+          const [classId, x, y, w, h, conf] = line.split(/\s+/).map(parseYoloNumber)
           return {
             classId: Number.isFinite(classId) ? classId : 0,
             x: Number.isFinite(x) ? x : 0,
@@ -2684,13 +3220,16 @@ function App() {
 
     // If the on-disk file was produced with a different box size, recompute once.
     if (!forceRecompute && folderHandle) {
-      const workflowRoot = await getWorkflowRootDir(false)
-      const faultsDir = workflowRoot ? await getFaultsDir(workflowRoot, false) : null
-      if (faultsDir) {
-        const disk = await readCenterFlagsDisk(faultsDir)
-        if (disk.meta && (disk.meta.boxW !== CENTER_BOX_W || disk.meta.boxH !== CENTER_BOX_H)) {
-          forceRecompute = true
-        }
+      const faultsDir = await getWorkspaceThermalFaultsDir(false)
+      const disk = faultsDir ? await readCenterFlagsDisk(faultsDir) : null
+      const legacyDisk = !disk ? (await (async () => {
+        const legacyFaultsDir = await getLegacyWorkflowFaultsDir(false)
+        return legacyFaultsDir ? await readCenterFlagsDisk(legacyFaultsDir) : null
+      })()) : null
+
+      const effective = disk || legacyDisk
+      if (effective?.meta && (effective.meta.boxW !== CENTER_BOX_W || effective.meta.boxH !== CENTER_BOX_H)) {
+        forceRecompute = true
       }
     }
 
@@ -2775,10 +3314,12 @@ function App() {
 
   const loadFaultsList = async () => {
     if (!folderHandle) return
-    const workflowRoot = await getWorkflowRootDir(false)
-    const text = workflowRoot ? await readTextFile(workflowRoot, 'faults.txt') : null
+    const faultsDir = await getWorkspaceThermalFaultsDir(false)
+    const text = faultsDir ? await readTextFile(faultsDir, 'faults.txt') : null
     if (!text) {
-      const fallback = await readTextFile(folderHandle, 'faults.txt')
+      const workflowRoot = await getWorkflowRootDir(false)
+      const legacy = workflowRoot ? await readTextFile(workflowRoot, 'faults.txt') : null
+      const fallback = legacy || (await readTextFile(folderHandle, 'faults.txt'))
       if (!fallback) {
         setFaultsList([])
         return
@@ -3059,14 +3600,17 @@ function App() {
       const normalized = normalizeFaultsText(draftPaths.join('\n'))
       const content = normalized.join('\n')
 
-      const workflowRoot = await getWorkflowRootDir(true)
-      if (!workflowRoot) throw new Error('Unable to access thermal folder')
-
-      const faultsDir = await getFaultsDir(workflowRoot, true)
-      if (faultsDir) {
-        await writeTextFile(faultsDir, 'faults.txt', content)
+      const faultsDir = await getWorkspaceThermalFaultsDirForPath(selectedPath, true)
+      if (!faultsDir) {
+        throw new Error(
+          openedThermalFolderDirectly
+            ? 'You opened the “thermal” folder directly. Open the parent folder that contains “thermal/” so the app can create a sibling “workspace/” folder.'
+            : openedRgbFolderDirectly
+              ? 'You opened the “rgb” folder directly. Open the parent folder that contains “thermal/” (and “rgb/”) so the app can create a sibling “workspace/” folder.'
+              : 'Open the parent folder that contains “thermal/” so the app can create a sibling “workspace/” folder.'
+        )
       }
-      await writeTextFile(workflowRoot, 'faults.txt', content)
+      await writeTextFile(faultsDir, 'faults.txt', content)
 
       setFaultsList(normalized)
       setReportText(content)
@@ -3139,6 +3683,70 @@ function App() {
     const maxW = 540
     const maxH = 610
     const children: Array<Paragraph | Table> = []
+
+    const items = draft.filter((d) => d.include)
+
+    const parseMetadataTimestampToDate = (raw: unknown): Date | null => {
+      if (raw === null || raw === undefined) return null
+      if (typeof raw === 'number' && Number.isFinite(raw)) {
+        const d = new Date(raw)
+        return Number.isFinite(d.getTime()) ? d : null
+      }
+
+      const s = String(raw).trim()
+      if (!s) return null
+
+      // Common EXIF/ExifTool format: "YYYY:MM:DD HH:MM:SS" (sometimes with timezone).
+      const m = s.match(
+        /^(\d{4})[:\-/](\d{2})[:\-/](\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?(?:\s*(Z|[+-]\d{2}:?\d{2})\s*)?$/
+      )
+      if (m) {
+        const year = Number(m[1])
+        const month = Number(m[2])
+        const day = Number(m[3])
+        const hour = m[4] ? Number(m[4]) : 0
+        const minute = m[5] ? Number(m[5]) : 0
+        const second = m[6] ? Number(m[6]) : 0
+        const tz = m[7] || ''
+
+        if (tz === 'Z' || /^[+-]\d{2}:?\d{2}$/.test(tz)) {
+          const mm = String(month).padStart(2, '0')
+          const dd = String(day).padStart(2, '0')
+          const hh = String(hour).padStart(2, '0')
+          const mi = String(minute).padStart(2, '0')
+          const ss = String(second).padStart(2, '0')
+          const tzNorm = tz === 'Z' ? 'Z' : tz.includes(':') ? tz : `${tz.slice(0, 3)}:${tz.slice(3)}`
+          const iso = `${year}-${mm}-${dd}T${hh}:${mi}:${ss}${tzNorm}`
+          const d = new Date(iso)
+          return Number.isFinite(d.getTime()) ? d : null
+        }
+
+        const d = new Date(year, month - 1, day, hour, minute, second)
+        return Number.isFinite(d.getTime()) ? d : null
+      }
+
+      const d = new Date(s)
+      return Number.isFinite(d.getTime()) ? d : null
+    }
+
+    const getCoverDateText = async (): Promise<string> => {
+      try {
+        const candidates = items.length ? items : draft
+        for (const item of candidates) {
+          const meta = await readMetadataForImagePath(item.path)
+          if (!meta) continue
+          const categories: any = meta?.categories && typeof meta.categories === 'object' ? meta.categories : {}
+          const timestamps = categories?.timestamps || {}
+          const ts = timestamps?.CreateDate ?? timestamps?.DateTimeOriginal ?? meta?.summary?.DateTimeOriginal ?? meta?.summary?.DateTime
+          const d = parseMetadataTimestampToDate(ts)
+          if (!d) continue
+          return new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }).format(d)
+        }
+      } catch {
+        // best-effort only
+      }
+      return ''
+    }
 
     const fileToImageRun = async (file: File, maxWidth: number, maxHeight: number): Promise<ImageRun | null> => {
       if (!file.type.startsWith('image/')) return null
@@ -3359,24 +3967,38 @@ function App() {
 
     // Cover page (always first page)
     // Use a borderless table with fixed row heights so placement is stable in Word and docx-preview.
-    const toposolLogo = await fetchPublicImageRun('toposol-logo.png', 'png', 700, 300, true)
-    const thermalLogo = await fetchPublicImageRun('thermal-logo.jpg', 'jpg', 580, 320, true)
-
+    const coverDateText = await getCoverDateText()
     const coverContentHeightTwip = Math.round(convertInchesToTwip(11.69 - 1.0)) // A4 height minus 0.5" top+bottom margins
     const coverHeights = {
-      topOffset: Math.round(convertInchesToTwip(0.35)),
-      topLogo: Math.round(convertInchesToTwip(1.35)),
-      spacer1: Math.round(convertInchesToTwip(1.85)),
-      title: Math.round(convertInchesToTwip(1.0)),
-      bottomLogo: Math.round(convertInchesToTwip(5)),
+      topOffset: Math.round(convertInchesToTwip(0.25)),
+      topLogo: Math.round(convertInchesToTwip(1.25)),
+      spacer1: Math.round(convertInchesToTwip(1.25)),
+      title: Math.round(convertInchesToTwip(0.8)),
+      date: Math.round(convertInchesToTwip(0.35)),
+      bottomLogo: Math.round(convertInchesToTwip(4.4)),
     }
+
+    // Prevent the cover top logo from being clipped by keeping its pixel height
+    // safely within the fixed row height.
+    const twipPerIn = convertInchesToTwip(1)
+    const topLogoRowIn = coverHeights.topLogo / twipPerIn
+    const topLogoMaxHeightPx = Math.max(80, Math.floor(topLogoRowIn * 96 * 0.9))
+
+    const toposolLogo = await fetchPublicImageRun('toposol-logo.png', 'png', 660, topLogoMaxHeightPx, true)
+    const thermalLogo = await fetchPublicImageRun('thermal-logo.jpg', 'jpg', 580, 320, true)
     const used =
       coverHeights.topOffset +
       coverHeights.topLogo +
       coverHeights.spacer1 +
       coverHeights.title +
+      coverHeights.date +
       coverHeights.bottomLogo
-    const spacer2 = Math.max(Math.round(convertInchesToTwip(1.0)), coverContentHeightTwip - used)
+    // Pull the bottom image slightly upward on the cover page.
+    const coverPullUpTwip = Math.round(convertInchesToTwip(0.65))
+    const minSpacer2 = Math.round(convertInchesToTwip(0.35))
+    const maxSpacer2 = Math.round(convertInchesToTwip(1.2))
+    const spacer2Raw = coverContentHeightTwip - used - coverPullUpTwip
+    const spacer2 = Math.min(maxSpacer2, Math.max(minSpacer2, spacer2Raw))
 
     const borderlessCell = (cellChildren: Paragraph[], verticalAlign: TableVerticalAlign = VerticalAlignTable.CENTER) =>
       new TableCell({
@@ -3390,7 +4012,10 @@ function App() {
         children: cellChildren,
       })
 
-    const spacerParagraph = () => new Paragraph({ children: [new TextRun({ text: '' })] })
+    const spacerParagraph = () => new Paragraph({ spacing: { before: 0, after: 0 }, children: [new TextRun({ text: '' })] })
+
+    const coverCenterParagraph = (runs: TextRun[] | ImageRun[]) =>
+      new Paragraph({ alignment: AlignmentType.CENTER, spacing: { before: 0, after: 0 }, children: runs })
 
     const coverTable = new Table({
       layout: TableLayoutType.FIXED,
@@ -3413,12 +4038,9 @@ function App() {
           children: [
             borderlessCell(
               [
-              new Paragraph({
-                alignment: AlignmentType.CENTER,
-                children: toposolLogo
-                  ? [toposolLogo]
-                  : [new TextRun({ text: '[Missing toposol-logo.png]', color: 'B91C1C' })],
-              }),
+                coverCenterParagraph(
+                  toposolLogo ? [toposolLogo] : [new TextRun({ text: '[Missing toposol-logo.png]', color: 'B91C1C' })]
+                ),
               ],
               VerticalAlignTable.BOTTOM
             ),
@@ -3432,10 +4054,15 @@ function App() {
           height: { value: coverHeights.title, rule: HeightRule.EXACT },
           children: [
             borderlessCell([
-              new Paragraph({
-                alignment: AlignmentType.CENTER,
-                children: [new TextRun({ text: 'THERMOGRAPHY REPORT', bold: true, size: 56 })],
-              }),
+              coverCenterParagraph([new TextRun({ text: 'THERMOGRAPHY REPORT', bold: true, size: 56 })]),
+            ]),
+          ],
+        }),
+        new TableRow({
+          height: { value: coverHeights.date, rule: HeightRule.EXACT },
+          children: [
+            borderlessCell([
+              coverCenterParagraph([new TextRun({ text: coverDateText || '', size: 22 })]),
             ]),
           ],
         }),
@@ -3447,12 +4074,9 @@ function App() {
           height: { value: coverHeights.bottomLogo, rule: HeightRule.EXACT },
           children: [
             borderlessCell([
-              new Paragraph({
-                alignment: AlignmentType.CENTER,
-                children: thermalLogo
-                  ? [thermalLogo]
-                  : [new TextRun({ text: '[Missing thermal-logo.jpg]', color: 'B91C1C' })],
-              }),
+              coverCenterParagraph(
+                thermalLogo ? [thermalLogo] : [new TextRun({ text: '[Missing thermal-logo.jpg]', color: 'B91C1C' })]
+              ),
             ]),
           ],
         }),
@@ -3461,29 +4085,13 @@ function App() {
 
     children.push(coverTable)
 
-    const items = draft.filter((d) => d.include)
-
-    // TOC page numbers are a best-effort estimate. When we append an RGB image
-    // under each Thermal image (when available), account for those extra pages.
-    const includedPathSet = new Set(items.map((it) => it.path))
-    const extraRgbCount = includeRgbPairs
-      ? items.filter((it) => {
-          const name = it.path.split('/').pop() || ''
-          const parsed = parseDjiTvVariant(name)
-          if (!parsed || parsed.variant !== 'T') return false
-          const rgbPath = getRgbPathForThermal(it.path)
-          if (!rgbPath) return false
-          if (!fileMap[rgbPath]) return false
-          // Avoid double-rendering if the RGB image is already explicitly included.
-          if (includedPathSet.has(rgbPath)) return false
-          return true
-        }).length
-      : 0
-
     const BOOKMARK_DESCRIPTION = 'section_description'
     const BOOKMARK_EQUIPMENT = 'section_equipment'
-    const BOOKMARK_IMAGES = 'section_images'
     const BOOKMARK_REPORTS = 'section_reports'
+    const BOOKMARK_IMAGE_PREFIX = 'section_report_image_'
+
+    // Used to avoid auto-rendering an RGB pair when that RGB image is already explicitly included.
+    const includedPathSet = new Set(items.map((it) => it.path))
 
     const sectionTitle = (title: string, bookmarkId: string) =>
       new Paragraph({
@@ -3502,14 +4110,12 @@ function App() {
 
     const descriptionPage = 2
     const equipmentPage = 3
-    const imagesPage = 4
-    // With our layout: Images title + first image are on page 4, then one page per remaining image,
-    // then Reports on the next page.
-    const reportsPage = 4 + items.length + extraRgbCount
+    const reportsPage = 4
 
     const tocRightStop = Math.round(convertInchesToTwip(7.1))
     const tocTitleStop = Math.round(convertInchesToTwip(0.7))
     const tocNumberStop = Math.round(convertInchesToTwip(0.55))
+    const tocImageIndent = Math.round(convertInchesToTwip(0.3))
 
     const tocLine = (index: number, title: string, bookmarkId: string, page: number) =>
       new Paragraph({
@@ -3534,6 +4140,29 @@ function App() {
         ],
       })
 
+    const tocImageLine = (index: number, token: string, bookmarkId: string, page: number) =>
+      new Paragraph({
+        alignment: AlignmentType.LEFT,
+        tabStops: [
+          { type: TabStopType.LEFT, position: tocImageIndent },
+          { type: TabStopType.RIGHT, position: tocNumberStop + tocImageIndent },
+          { type: TabStopType.LEFT, position: tocTitleStop + tocImageIndent },
+          { type: TabStopType.RIGHT, position: tocRightStop, leader: LeaderType.DOT },
+        ],
+        spacing: { before: 40, after: 40 },
+        children: [
+          new TextRun({ text: '\t' }),
+          new TextRun({ text: `${index}.` }),
+          new TextRun({ text: '\t\t' }),
+          new InternalHyperlink({
+            anchor: bookmarkId,
+            children: [new TextRun({ text: token, color: '000000' })],
+          }),
+          new TextRun({ text: '\t' }),
+          new TextRun({ text: String(page) }),
+        ],
+      })
+
     children.push(
       new Paragraph({ children: [new TextRun({ text: '' })], spacing: { after: 260 } }),
       new Paragraph({
@@ -3543,8 +4172,13 @@ function App() {
       }),
       tocLine(1, 'Description', BOOKMARK_DESCRIPTION, descriptionPage),
       tocLine(2, 'Equipment', BOOKMARK_EQUIPMENT, equipmentPage),
-      tocLine(3, 'Images', BOOKMARK_IMAGES, imagesPage),
-      tocLine(4, 'Reports (anomaly detected)', BOOKMARK_REPORTS, reportsPage)
+      tocLine(3, 'Reports (anomaly detected)', BOOKMARK_REPORTS, reportsPage),
+      ...items.map((it, idx) => {
+        const token = getTocImageToken(it.path) || (it.path.split('/').pop() || it.path)
+        // Best-effort: assume 1 page per image item (tables may add extra pages).
+        const page = reportsPage + idx
+        return tocImageLine(idx + 1, token, `${BOOKMARK_IMAGE_PREFIX}${idx + 1}`, page)
+      })
     )
 
     // Page 3: Description
@@ -3634,9 +4268,10 @@ function App() {
       }
     }
 
-    // Images section: start a new page, show the title, then start the first image on the same page.
+    // Reports section: start a new page, show the title, then start the first image on the same page.
     children.push(new Paragraph({ children: [new PageBreak()] }))
-    children.push(sectionTitle('Images', BOOKMARK_IMAGES))
+    children.push(sectionTitle('Reports (anomaly detected)', BOOKMARK_REPORTS))
+    children.push(new Paragraph({ children: [new TextRun({ text: '' })] }))
 
     for (let idx = 0; idx < items.length; idx += 1) {
       const item = items[idx]
@@ -3648,6 +4283,20 @@ function App() {
       if (idx > 0) {
         children.push(new Paragraph({ children: [new PageBreak()] }))
       }
+
+      const tocToken = getTocImageToken(item.path)
+      children.push(
+        new Paragraph({
+          alignment: AlignmentType.CENTER,
+          spacing: { after: 60 },
+          children: [
+            new Bookmark({
+              id: `${BOOKMARK_IMAGE_PREFIX}${idx + 1}`,
+              children: [new TextRun({ text: `${idx + 1}. ${tocToken || ''}`.trim(), bold: true, size: 28 })],
+            }),
+          ],
+        })
+      )
 
       children.push(
         new Paragraph({
@@ -3682,9 +4331,103 @@ function App() {
 
       const buf = await file.arrayBuffer()
       const { width, height } = await getImageSize(file)
-      const scale = Math.min(maxW / width, maxH / height, 1)
-      const w = Math.max(1, Math.round(width * scale))
-      const h = Math.max(1, Math.round(height * scale))
+
+      // Pagination/fit bookkeeping (inches). We use this only to decide whether tables can start
+      // under the thermal image when there is NO RGB pair.
+      const A4_HEIGHT_IN = 11.69
+      const PAGE_MARGINS_IN = 1.0 // 0.5" top + 0.5" bottom
+      const HEADER_RESERVE_IN = 0.20
+      const FOOTER_RESERVE_IN = 0.35
+      const CONTENT_HEIGHT_IN = A4_HEIGHT_IN - PAGE_MARGINS_IN - HEADER_RESERVE_IN - FOOTER_RESERVE_IN
+
+      const THERMAL_CAPTION_IN = 0.30
+      const CAPTION_GAP_IN = 0.12
+      const RGB_CAPTION_SPACING_IN = (140 + 60) / 1440
+      const IMAGE_GAP_AFTER_IN = 0.14
+
+      // Determine if we will render the paired RGB on the SAME page.
+      // If yes, we will scale both images so the combined height fits.
+      let rgbRender:
+        | null
+        | {
+            path: string
+            file: File
+            imageType: 'png' | 'jpg' | 'gif' | 'bmp'
+            width: number
+            height: number
+            buf: ArrayBuffer
+          } = null
+
+      if (includeRgbPairs) {
+        try {
+          const base = item.path.split('/').pop() || ''
+          const parsed = parseDjiTvVariant(base)
+          const isThermal = Boolean(parsed && parsed.variant === 'T')
+          const rgbPath = isThermal ? getRgbPathForThermal(item.path) : null
+
+          if (rgbPath && fileMap[rgbPath] && !includedPathSet.has(rgbPath)) {
+            const rgbFile = fileMap[rgbPath]
+            if (rgbFile && rgbFile.type.startsWith('image/')) {
+              const rgbImageType = (() => {
+                const t = (rgbFile.type || '').toLowerCase()
+                if (t === 'image/png') return 'png'
+                if (t === 'image/jpeg' || t === 'image/jpg') return 'jpg'
+                if (t === 'image/gif') return 'gif'
+                if (t === 'image/bmp') return 'bmp'
+                return null
+              })()
+
+              if (rgbImageType) {
+                const rgbBuf = await rgbFile.arrayBuffer()
+                const rgbSize = await getImageSize(rgbFile)
+                rgbRender = {
+                  path: rgbPath,
+                  file: rgbFile,
+                  imageType: rgbImageType,
+                  width: rgbSize.width,
+                  height: rgbSize.height,
+                  buf: rgbBuf,
+                }
+              }
+            }
+          }
+        } catch {
+          // best-effort only
+        }
+      }
+
+      // Compute final image sizes.
+      let scale = Math.min(maxW / width, maxH / height, 1)
+      let w = Math.max(1, Math.round(width * scale))
+      let h = Math.max(1, Math.round(height * scale))
+
+      // If RGB will be rendered on the same page, downscale BOTH images to fit within the page.
+      // This avoids preview/PDF weirdness and keeps the layout stable.
+      let rgbW = 0
+      let rgbH = 0
+      if (rgbRender) {
+        const scaleRgbWidth = Math.min(maxW / Math.max(1, rgbRender.width), maxH / Math.max(1, rgbRender.height), 1)
+
+        const thermalHpx = height * scale
+        const rgbHpx = rgbRender.height * scaleRgbWidth
+
+        // Total non-image vertical space (captions + gaps + reserve).
+        const nonImageIn = THERMAL_CAPTION_IN + CAPTION_GAP_IN + (THERMAL_CAPTION_IN + RGB_CAPTION_SPACING_IN) + CAPTION_GAP_IN + IMAGE_GAP_AFTER_IN
+        const maxCombinedImagesPx = Math.max(1, Math.floor(Math.max(0.5, CONTENT_HEIGHT_IN - nonImageIn) * 96))
+
+        const sumPx = Math.max(1, thermalHpx + rgbHpx)
+        // Safety factor: Word/LibreOffice can differ slightly in layout; keep a bit of headroom.
+        const pairedSafety = 0.92
+        const down = Math.min(1, (maxCombinedImagesPx * pairedSafety) / sumPx)
+
+        const finalThermalScale = scale * down
+        const finalRgbScale = scaleRgbWidth * down
+
+        w = Math.max(1, Math.round(width * finalThermalScale))
+        h = Math.max(1, Math.round(height * finalThermalScale))
+        rgbW = Math.max(1, Math.round(rgbRender.width * finalRgbScale))
+        rgbH = Math.max(1, Math.round(rgbRender.height * finalRgbScale))
+      }
 
       const labels = await readLabelsForPath(item.path)
 
@@ -3724,123 +4467,98 @@ function App() {
         )
       }
 
-      // A4 content-height bookkeeping (inches) for this page.
-      // docx-preview's footer/header rendering can effectively reduce usable
-      // body height; reserve some extra space so the footer/page number is never clipped.
-      const A4_HEIGHT_IN = 11.69
-      const PAGE_MARGINS_IN = 1.0 // 0.5" top + 0.5" bottom
-      const HEADER_RESERVE_IN = 0.20
-      const FOOTER_RESERVE_IN = 0.35
-      const CONTENT_HEIGHT_IN = A4_HEIGHT_IN - PAGE_MARGINS_IN - HEADER_RESERVE_IN - FOOTER_RESERVE_IN
+      // Optional paired RGB image (same page).
+      const didRenderRgb = Boolean(rgbRender)
+      if (rgbRender) {
+        children.push(
+          new Paragraph({
+            alignment: AlignmentType.CENTER,
+            spacing: { before: 140, after: 60 },
+            children: [new TextRun({ text: fileStemFromPath(rgbRender.path), bold: true })],
+          })
+        )
 
-      const CAPTION_IN = 0.30
-      const CAPTION_GAP_IN = 0.12
-      const IMAGE_GAP_AFTER_IN = 0.14
+        const rgbLabels = await readRgbLabelsForRgbPath(rgbRender.path)
 
-      const thermalImageHeightIn = h / 96
-      let remainingIn = CONTENT_HEIGHT_IN - (CAPTION_IN + CAPTION_GAP_IN + thermalImageHeightIn + IMAGE_GAP_AFTER_IN)
-      if (!Number.isFinite(remainingIn)) remainingIn = 0
-
-      const ensureSpaceOrBreak = (needIn: number) => {
-        if (needIn <= 0) return
-        if (remainingIn >= needIn) {
-          remainingIn -= needIn
-          return
+        let usedRgbLabeled = false
+        if (rgbLabels.length > 0) {
+          try {
+            const labeledBytes = await renderLabeledPngBytes(rgbRender.file, rgbLabels, rgbW, rgbH)
+            pushImageParagraph(
+              new ImageRun({
+                type: 'png',
+                data: labeledBytes,
+                transformation: { width: rgbW, height: rgbH },
+              })
+            )
+            usedRgbLabeled = true
+          } catch {
+            usedRgbLabeled = false
+          }
         }
-        children.push(new Paragraph({ children: [new PageBreak()] }))
-        remainingIn = Math.max(0, CONTENT_HEIGHT_IN - needIn)
+
+        if (!usedRgbLabeled) {
+          pushImageParagraph(
+            new ImageRun({
+              type: rgbRender.imageType,
+              data: new Uint8Array(rgbRender.buf),
+              transformation: { width: rgbW, height: rgbH },
+            })
+          )
+        }
       }
 
-      // If this is a Thermal image, optionally append the paired RGB image directly under it.
-      // We do this inside the same Images section so preview/PDF/DOCX stay consistent.
-      if (includeRgbPairs) {
-        try {
-          const base = item.path.split('/').pop() || ''
-          const parsed = parseDjiTvVariant(base)
-          const isThermal = Boolean(parsed && parsed.variant === 'T')
-          const rgbPath = isThermal ? getRgbPathForThermal(item.path) : null
+      // Pre-compute whether we will render a QR block.
+      let qrBlock: null | { bytes: Uint8Array; lat: any; lon: any } = null
+      try {
+        const meta = await readMetadataForImagePath(item.path)
+        if (meta) {
+          const defaults = computeDefaultMetadataSelections(meta, item.path)
+          const selTiffEntry = findMatchingTiffForImage(item.path)
+          const selTiffKey = selTiffEntry?.path || ''
+          const existingSel = (selTiffKey && viewMetadataSelections[selTiffKey]) || {}
+          const sel = { ...defaults, ...existingSel }
 
-          if (rgbPath && fileMap[rgbPath] && !includedPathSet.has(rgbPath)) {
-            const rgbFile = fileMap[rgbPath]
-            if (rgbFile && rgbFile.type.startsWith('image/')) {
-              const rgbImageType = (() => {
-                const t = (rgbFile.type || '').toLowerCase()
-                if (t === 'image/png') return 'png'
-                if (t === 'image/jpeg' || t === 'image/jpg') return 'jpg'
-                if (t === 'image/gif') return 'gif'
-                if (t === 'image/bmp') return 'bmp'
-                return null
-              })()
+          if (sel['geolocation.qr_code'] === true) {
+            const qrName = meta?.qr_png || meta?.categories?.maps?.qr_png
+            let bytes: Uint8Array | null = null
 
-              if (!rgbImageType) {
-                children.push(
-                  new Paragraph({
-                    alignment: AlignmentType.CENTER,
-                    children: [new TextRun({ text: `Unsupported RGB image type for Word export: ${rgbFile.type}`, color: 'B91C1C' })],
-                  })
-                )
-              } else {
-                const rgbBuf = await rgbFile.arrayBuffer()
-                const rgbSize = await getImageSize(rgbFile)
-                const rgbScale = Math.min(maxW / rgbSize.width, maxH / rgbSize.height, 1)
-                const rgbW = Math.max(1, Math.round(rgbSize.width * rgbScale))
-                const rgbH = Math.max(1, Math.round(rgbSize.height * rgbScale))
+            const categories: any = meta?.categories && typeof meta.categories === 'object' ? meta.categories : {}
+            const geo = categories?.geolocation || {}
+            const lat = geo?.latitude ?? meta?.summary?.Latitude
+            const lon = geo?.longitude ?? meta?.summary?.Longitude
 
-                // If the paired RGB block doesn't fit on the current page, push it to the next page.
-                // IMPORTANT: reserve space BEFORE adding the caption, otherwise the caption itself
-                // can end up at the bottom and clip the footer in preview/PDF.
-                const RGB_CAPTION_SPACING_IN = (160 + 60) / 1440
-                const rgbNeedIn = CAPTION_IN + RGB_CAPTION_SPACING_IN + CAPTION_GAP_IN + rgbH / 96 + IMAGE_GAP_AFTER_IN
-                ensureSpaceOrBreak(rgbNeedIn)
+            if (typeof qrName === 'string' && qrName.trim()) {
+              const metadataDir = await getWorkspaceThermalMetadataDir(false)
+              const legacyFaultsDir = !metadataDir ? await getLegacyWorkflowFaultsDir(false) : null
+              const legacyMetadataDir = legacyFaultsDir?.getDirectoryHandle
+                ? await legacyFaultsDir.getDirectoryHandle('metadata', { create: false })
+                : null
 
-                children.push(
-                  new Paragraph({
-                    alignment: AlignmentType.CENTER,
-                    spacing: { before: 160, after: 60 },
-                    // RGB caption must show the RGB filename.
-                    children: [new TextRun({ text: fileStemFromPath(rgbPath), bold: true })],
-                  })
-                )
-
-                const rgbLabels = await readRgbLabelsForRgbPath(rgbPath)
-
-                let usedRgbLabeled = false
-                if (rgbLabels.length > 0) {
-                  try {
-                    const labeledBytes = await renderLabeledPngBytes(rgbFile, rgbLabels, rgbW, rgbH)
-                    pushImageParagraph(
-                      new ImageRun({
-                        type: 'png',
-                        data: labeledBytes,
-                        transformation: { width: rgbW, height: rgbH },
-                      })
-                    )
-                    usedRgbLabeled = true
-                  } catch {
-                    usedRgbLabeled = false
-                  }
-                }
-
-                if (!usedRgbLabeled) {
-                  pushImageParagraph(
-                    new ImageRun({
-                      type: rgbImageType,
-                      data: new Uint8Array(rgbBuf),
-                      transformation: { width: rgbW, height: rgbH },
-                    })
-                  )
-                }
+              const dir = metadataDir || legacyMetadataDir
+              if (dir && dir.getFileHandle) {
+                const fh = await dir.getFileHandle(qrName)
+                const f = await fh.getFile()
+                const buf = await f.arrayBuffer()
+                bytes = new Uint8Array(buf)
               }
+            } else if (typeof meta?.qr_png_base64 === 'string' && meta.qr_png_base64.length > 0) {
+              bytes = Uint8Array.from(atob(meta.qr_png_base64), (c) => c.charCodeAt(0))
+            }
+
+            if (bytes) {
+              qrBlock = { bytes, lat, lon }
             }
           }
-        } catch {
-          // Best-effort only.
         }
+      } catch {
+        // best-effort only
       }
 
       // One or more user-defined tables under the image (centered). No column header row.
-      // docx-preview (used for preview + PDF capture) does not reliably paginate very large tables.
-      // To avoid overflow/cut-off, we split tables into page-sized chunks using a simple height heuristic.
+      // IMPORTANT: Let Word handle pagination naturally.
+      // If we pre-split into chunks and inject PageBreaks, Word can leave unused space on a page.
+      // Also, ensure rows are allowed to break across pages (cantSplit=false).
       const cellBorders = {
         top: { style: BorderStyle.SINGLE, size: 6, color: 'D1D5DB' },
         bottom: { style: BorderStyle.SINGLE, size: 6, color: 'D1D5DB' },
@@ -3861,6 +4579,7 @@ function App() {
         new Table({
           width: { size: 86, type: WidthType.PERCENTAGE },
           layout: TableLayoutType.FIXED,
+          alignment: AlignmentType.CENTER,
           borders: {
             top: { style: BorderStyle.SINGLE, size: 6, color: 'D1D5DB' },
             bottom: { style: BorderStyle.SINGLE, size: 6, color: 'D1D5DB' },
@@ -3877,6 +4596,9 @@ function App() {
             const descText = (r.description || '').trim()
 
             return new TableRow({
+              // Allow rows to break across pages (Word setting: "Allow row to break across pages").
+              // This is key for preventing entire tables from being pushed to the next page.
+              cantSplit: false,
               children: [
                 new TableCell({
                   width: { size: 33, type: WidthType.PERCENTAGE },
@@ -3886,6 +4608,8 @@ function App() {
                   shading: { type: ShadingType.CLEAR, color: 'auto', fill: nameFill },
                   children: [
                     new Paragraph({
+                      keepNext: false,
+                      keepLines: false,
                       spacing: { before: 40, after: 40 },
                       children: [new TextRun({ text: nameText, bold: true, size: TABLE_TEXT_SIZE })],
                     }),
@@ -3899,6 +4623,8 @@ function App() {
                   shading: { type: ShadingType.CLEAR, color: 'auto', fill: zebraFill },
                   children: [
                     new Paragraph({
+                      keepNext: false,
+                      keepLines: false,
                       spacing: { before: 40, after: 40 },
                       children: paragraphRunsFromMultilineSized(descText, TABLE_TEXT_SIZE),
                     }),
@@ -3909,246 +4635,154 @@ function App() {
           }),
         })
 
-      const estimateWrappedLineCount = (text: string, approxCharsPerLine: number) => {
-        const t = (text || '').trim()
-        if (!t) return 1
-        const explicitLines = t.replace(/\r\n/g, '\n').split('\n').filter((s) => s.length > 0).length
-        const approxLines = Math.max(1, Math.ceil(t.length / Math.max(10, approxCharsPerLine)))
-        return Math.max(explicitLines || 1, approxLines)
-      }
-
-      const estimateRowHeightIn = (name: string, description: string) => {
-        // Heuristic: ~11pt text, modest padding.
-        const nameLines = estimateWrappedLineCount(name, 22)
-        const descLines = estimateWrappedLineCount(description, 48)
-        const lines = Math.max(nameLines, descLines)
-        // Be a bit conservative so tables don't run into the footer area.
-        const perLine = 0.22
-        const padding = 0.14
-        const borders = 0.04
-        return lines * perLine + padding + borders
-      }
-
       const pushTableTitle = (title: string) => {
         const t = (title || '').trim()
-        if (t) {
-          children.push(
-            new Paragraph({
-              alignment: AlignmentType.CENTER,
-              spacing: { before: 160, after: 80 },
-              children: [new TextRun({ text: t, bold: true })],
-            })
-          )
-        } else {
-          children.push(new Paragraph({ children: [new TextRun({ text: '' })] }))
-        }
+        if (!t) return
+
+        children.push(
+          new Paragraph({
+            alignment: AlignmentType.CENTER,
+            spacing: { before: 160, after: 80 },
+            // Prevent orphan titles at the bottom of a page.
+            // Keep the title with the next block (the table).
+            keepNext: true,
+            keepLines: true,
+            children: [new TextRun({ text: t, bold: true })],
+          })
+        )
       }
 
       const tablesToRender = Array.isArray(item.tables) && item.tables.length ? item.tables : []
-      if (tablesToRender.length > 0) {
-        // Let tables start on the same page under the image and break across pages.
-        // Only force a break if there's too little room left to avoid leaving a
-        // title/first row stranded at the bottom.
-        if (remainingIn < 1.25) {
+
+      // Table placement rules:
+      // - If RGB was rendered, always start tables/QR on the next page (page is dedicated to the images).
+      // - If NO RGB, allow tables/QR to start under the thermal image on the same page when there is space.
+      if ((tablesToRender.length > 0 || qrBlock) && didRenderRgb) {
+        children.push(new Paragraph({ children: [new PageBreak()] }))
+      } else if (tablesToRender.length > 0 || qrBlock) {
+        // Estimate remaining space after the thermal block.
+        const thermalImageIn = h / 96
+        const remainingIn = Math.max(0, CONTENT_HEIGHT_IN - (THERMAL_CAPTION_IN + CAPTION_GAP_IN + thermalImageIn + IMAGE_GAP_AFTER_IN))
+        // If there's very little room left, don't strand a table at the bottom.
+        if (remainingIn < 1.05) {
           children.push(new Paragraph({ children: [new PageBreak()] }))
-          remainingIn = CONTENT_HEIGHT_IN
         }
       }
+
       for (const t of tablesToRender) {
         const title = (t.title || '').trim()
         const rawRows = (t.rows || []).filter((r) => (r.name || '').trim() || (r.description || '').trim())
         const rows: Array<Pick<DocxDraftTableRow, 'name' | 'description'>> = rawRows.length ? rawRows : [{ name: '', description: '' }]
 
-        // Estimate how many inches this title consumes.
-        const titleIn = title ? 0.30 : 0.18
-        const afterTableGapIn = 0.16
-
-        // Split a single table into multiple tables if it won't fit.
-        // We repeat the title at the top of each chunk so it remains understandable.
-        const maxChunkHeightIn = Math.max(1.0, CONTENT_HEIGHT_IN - titleIn - afterTableGapIn)
-        let cursor = 0
-        while (cursor < rows.length) {
-          // If we're mid-page and there's not enough space for at least the title + one row, go to next page.
-          const minRowIn = estimateRowHeightIn(rows[cursor].name || '', rows[cursor].description || '')
-          if (remainingIn < titleIn + minRowIn) {
-            children.push(new Paragraph({ children: [new PageBreak()] }))
-            remainingIn = CONTENT_HEIGHT_IN
-          }
-
-          // Consume title.
-          ensureSpaceOrBreak(titleIn)
-          pushTableTitle(title)
-
-          // Prefer filling the remaining space on the current page.
-          // This avoids moving an entire table chunk to the next page when a smaller
-          // chunk could fit at the bottom of the current page.
-          const chunkLimitIn = Math.min(maxChunkHeightIn, Math.max(1.0, remainingIn - afterTableGapIn))
-
-          // Build a chunk of rows that fits.
-          const chunk: Array<Pick<DocxDraftTableRow, 'name' | 'description'>> = []
-          let chunkHeight = 0.18 // table overhead
-          while (cursor < rows.length) {
-            const r = rows[cursor]
-            const rh = estimateRowHeightIn(r.name || '', r.description || '')
-            if (chunk.length > 0 && chunkHeight + rh > chunkLimitIn) break
-            if (chunk.length === 0 && rh > chunkLimitIn) {
-              // Worst case: one very tall row; still render it alone.
-              chunk.push(r)
-              cursor += 1
-              chunkHeight += rh
-              break
-            }
-            chunk.push(r)
-            cursor += 1
-            chunkHeight += rh
-          }
-
-          ensureSpaceOrBreak(chunkHeight)
-          children.push(makeDraftTable(chunk))
-          ensureSpaceOrBreak(afterTableGapIn)
-
-          if (cursor < rows.length) {
-            // More rows remain: continue on the next page.
-            children.push(new Paragraph({ children: [new PageBreak()] }))
-            remainingIn = CONTENT_HEIGHT_IN
-          }
-        }
+        pushTableTitle(title)
+        children.push(makeDraftTable(rows))
+        // Small gap after each table.
+        children.push(new Paragraph({ children: [new TextRun({ text: '' })], spacing: { after: 140 } }))
       }
 
       // Optional QR code block (based on the View metadata checkbox state).
-      try {
-        const meta = await readMetadataForImagePath(item.path)
-        if (meta) {
-          const defaults = computeDefaultMetadataSelections(meta, item.path)
-          const selTiffEntry = findMatchingTiffForImage(item.path)
-          const selTiffKey = selTiffEntry?.path || ''
-          const existingSel = (selTiffKey && viewMetadataSelections[selTiffKey]) || {}
-          const sel = { ...defaults, ...existingSel }
-
-          if (sel['geolocation.qr_code'] === true) {
-            const qrName = meta?.qr_png || meta?.categories?.maps?.qr_png
-            let bytes: Uint8Array | null = null
-
-            const categories: any = meta?.categories && typeof meta.categories === 'object' ? meta.categories : {}
-            const geo = categories?.geolocation || {}
-            const lat = geo?.latitude ?? meta?.summary?.Latitude
-            const lon = geo?.longitude ?? meta?.summary?.Longitude
-
-            const coordText = (v: any) => {
-              if (v === null || v === undefined || v === '') return 'N/A'
-              if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'N/A'
-              if (typeof v === 'string') return v.trim() || 'N/A'
-              return String(v)
-            }
-
-            if (typeof qrName === 'string' && qrName.trim()) {
-              const faultsDir = await getWorkflowFaultsDir(false)
-              const metadataDir = faultsDir && faultsDir.getDirectoryHandle ? await faultsDir.getDirectoryHandle('metadata', { create: false }) : null
-              if (metadataDir && metadataDir.getFileHandle) {
-                const fh = await metadataDir.getFileHandle(qrName)
-                const f = await fh.getFile()
-                const buf = await f.arrayBuffer()
-                bytes = new Uint8Array(buf)
-              }
-            } else if (typeof meta?.qr_png_base64 === 'string' && meta.qr_png_base64.length > 0) {
-              bytes = Uint8Array.from(atob(meta.qr_png_base64), (c) => c.charCodeAt(0))
-            }
-
-            if (bytes) {
-              // Geolocation block: match the desired layout (QR left, coords right).
-              const QR_PX = 210
-              const geoNeedIn = 0.32 + 0.10 + (QR_PX / 96) + 0.70
-              ensureSpaceOrBreak(geoNeedIn)
-
-              children.push(
-                new Paragraph({
-                  alignment: AlignmentType.LEFT,
-                  spacing: { before: 160, after: 80 },
-                  children: [new TextRun({ text: 'Geolocation', bold: true })],
-                })
-              )
-
-              const geoCellBorders = {
-                top: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
-                bottom: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
-                left: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
-                right: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
-              }
-
-              const geoTable = new Table({
-                width: { size: 80, type: WidthType.PERCENTAGE },
-                layout: TableLayoutType.FIXED,
-                alignment: AlignmentType.CENTER,
-                borders: {
-                  top: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
-                  bottom: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
-                  left: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
-                  right: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
-                  insideHorizontal: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
-                  insideVertical: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
-                },
-                rows: [
-                  new TableRow({
-                    children: [
-                      new TableCell({
-                        width: { size: 66, type: WidthType.PERCENTAGE },
-                        borders: geoCellBorders,
-                        margins: { top: 120, bottom: 120, left: 120, right: 120 },
-                        verticalAlign: VerticalAlignTable.CENTER,
-                        children: [
-                          new Paragraph({
-                            alignment: AlignmentType.CENTER,
-                            children: [
-                              new ImageRun({
-                                type: 'png',
-                                data: bytes,
-                                transformation: { width: QR_PX, height: QR_PX },
-                              }),
-                            ],
-                          }),
-                        ],
-                      }),
-                      new TableCell({
-                        width: { size: 34, type: WidthType.PERCENTAGE },
-                        borders: geoCellBorders,
-                        margins: { top: 180, bottom: 180, left: 220, right: 220 },
-                        verticalAlign: VerticalAlignTable.TOP,
-                        children: [
-                          new Paragraph({
-                            spacing: { after: 120 },
-                            children: [new TextRun({ text: 'Latitude', bold: true })],
-                          }),
-                          new Paragraph({
-                            spacing: { after: 240 },
-                            children: [new TextRun({ text: coordText(lat) })],
-                          }),
-                          new Paragraph({
-                            spacing: { after: 120 },
-                            children: [new TextRun({ text: 'Longitude', bold: true })],
-                          }),
-                          new Paragraph({
-                            children: [new TextRun({ text: coordText(lon) })],
-                          }),
-                        ],
-                      }),
-                    ],
-                  }),
-                ],
-              })
-
-              children.push(geoTable)
-            }
-          }
+      if (qrBlock) {
+        const coordText = (v: any) => {
+          if (v === null || v === undefined || v === '') return 'N/A'
+          if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'N/A'
+          if (typeof v === 'string') return v.trim() || 'N/A'
+          return String(v)
         }
-      } catch {
-        // best-effort only
+
+        const QR_PX = 210
+
+        children.push(
+          new Paragraph({
+            alignment: AlignmentType.LEFT,
+            spacing: { before: 160, after: 80 },
+            keepNext: true,
+            keepLines: true,
+            children: [new TextRun({ text: 'Geolocation', bold: true })],
+          })
+        )
+
+        const geoCellBorders = {
+          top: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
+          bottom: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
+          left: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
+          right: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
+        }
+
+        const geoTable = new Table({
+          width: { size: 80, type: WidthType.PERCENTAGE },
+          layout: TableLayoutType.FIXED,
+          alignment: AlignmentType.CENTER,
+          borders: {
+            top: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
+            bottom: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
+            left: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
+            right: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
+            insideHorizontal: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
+            insideVertical: { style: BorderStyle.SINGLE, size: 8, color: '000000' },
+          },
+          rows: [
+            new TableRow({
+              cantSplit: false,
+              children: [
+                new TableCell({
+                  width: { size: 66, type: WidthType.PERCENTAGE },
+                  borders: geoCellBorders,
+                  margins: { top: 120, bottom: 120, left: 120, right: 120 },
+                  verticalAlign: VerticalAlignTable.CENTER,
+                  children: [
+                    new Paragraph({
+                      alignment: AlignmentType.CENTER,
+                      keepNext: false,
+                      keepLines: false,
+                      children: [
+                        new ImageRun({
+                          type: 'png',
+                          data: qrBlock.bytes,
+                          transformation: { width: QR_PX, height: QR_PX },
+                        }),
+                      ],
+                    }),
+                  ],
+                }),
+                new TableCell({
+                  width: { size: 34, type: WidthType.PERCENTAGE },
+                  borders: geoCellBorders,
+                  margins: { top: 180, bottom: 180, left: 220, right: 220 },
+                  verticalAlign: VerticalAlignTable.TOP,
+                  children: [
+                    new Paragraph({
+                      keepNext: false,
+                      keepLines: false,
+                      spacing: { after: 120 },
+                      children: [new TextRun({ text: 'Latitude', bold: true })],
+                    }),
+                    new Paragraph({
+                      keepNext: false,
+                      keepLines: false,
+                      spacing: { after: 240 },
+                      children: [new TextRun({ text: coordText(qrBlock.lat) })],
+                    }),
+                    new Paragraph({
+                      keepNext: false,
+                      keepLines: false,
+                      spacing: { after: 120 },
+                      children: [new TextRun({ text: 'Longitude', bold: true })],
+                    }),
+                    new Paragraph({
+                      keepNext: false,
+                      keepLines: false,
+                      children: [new TextRun({ text: coordText(qrBlock.lon) })],
+                    }),
+                  ],
+                }),
+              ],
+            }),
+          ],
+        })
+
+        children.push(geoTable)
       }
     }
-
-    // Reports section (starts after all image pages)
-    children.push(new Paragraph({ children: [new PageBreak()] }))
-    children.push(sectionTitle('Reports (anomaly detected)', BOOKMARK_REPORTS))
-    children.push(new Paragraph({ children: [new TextRun({ text: '' })] }))
 
     const coverFooter = new Footer({
       children: [
@@ -4189,23 +4823,6 @@ function App() {
       zIndex: 0,
     }
 
-    const tinyLogoFloating: IFloating = {
-      horizontalPosition: {
-        relative: HorizontalPositionRelativeFrom.MARGIN,
-        align: HorizontalPositionAlign.LEFT,
-      },
-      verticalPosition: {
-        relative: VerticalPositionRelativeFrom.MARGIN,
-        align: VerticalPositionAlign.TOP,
-      },
-      behindDocument: false,
-      allowOverlap: true,
-      wrap: {
-        type: TextWrappingType.NONE,
-      },
-      zIndex: 10,
-    }
-
     const buildWatermarkLogoRun = async (): Promise<ImageRun | null> => {
       try {
         const base = import.meta.env.BASE_URL || '/'
@@ -4237,7 +4854,7 @@ function App() {
         const w = Math.max(1, Math.round(bitmap.width * scale))
         const h = Math.max(1, Math.round(bitmap.height * scale))
 
-        ctx.globalAlpha = 0.12
+        ctx.globalAlpha = 0.18
         ctx.drawImage(bitmap, -w / 2, -h / 2, w, h)
         ctx.restore()
         bitmap.close()
@@ -4263,18 +4880,9 @@ function App() {
     }
 
     const watermarkLogo = await buildWatermarkLogoRun()
-    const tinyToposolLogo = await fetchPublicImageRun('toposol-logo.png', 'png', 70, 70, true, tinyLogoFloating)
+    const tinyToposolFooterLogo = await fetchPublicImageRun('toposol-logo.png', 'png', 36, 36, true)
 
     const headerChildren: Paragraph[] = []
-
-    if (tinyToposolLogo) {
-      headerChildren.push(
-        new Paragraph({
-          alignment: AlignmentType.LEFT,
-          children: [tinyToposolLogo],
-        })
-      )
-    }
 
     headerChildren.push(
       new Paragraph({
@@ -4300,11 +4908,56 @@ function App() {
       children: [new Paragraph({ children: [new TextRun({ text: '' })] })],
     })
 
-    const pageNumberFooter = new Footer({
+    const footerBordersNone = {
+      top: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+      bottom: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+      left: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+      right: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+    }
+
+    const defaultFooter = new Footer({
       children: [
-        new Paragraph({
-          alignment: AlignmentType.RIGHT,
-          children: [new TextRun({ children: ['Page | ', PageNumber.CURRENT] })],
+        new Table({
+          layout: TableLayoutType.FIXED,
+          width: { size: 100, type: WidthType.PERCENTAGE },
+          borders: {
+            top: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+            bottom: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+            left: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+            right: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+            insideHorizontal: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+            insideVertical: { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' },
+          },
+          rows: [
+            new TableRow({
+              children: [
+                new TableCell({
+                  width: { size: 30, type: WidthType.PERCENTAGE },
+                  borders: footerBordersNone,
+                  margins: { top: 40, bottom: 40, left: 0, right: 0 },
+                  verticalAlign: VerticalAlignTable.CENTER,
+                  children: [
+                    new Paragraph({
+                      alignment: AlignmentType.LEFT,
+                      children: tinyToposolFooterLogo ? [tinyToposolFooterLogo] : [],
+                    }),
+                  ],
+                }),
+                new TableCell({
+                  width: { size: 70, type: WidthType.PERCENTAGE },
+                  borders: footerBordersNone,
+                  margins: { top: 40, bottom: 40, left: 0, right: 0 },
+                  verticalAlign: VerticalAlignTable.CENTER,
+                  children: [
+                    new Paragraph({
+                      alignment: AlignmentType.RIGHT,
+                      children: [new TextRun({ children: ['Page | ', PageNumber.CURRENT] })],
+                    }),
+                  ],
+                }),
+              ],
+            }),
+          ],
         }),
       ],
     })
@@ -4338,7 +4991,7 @@ function App() {
           },
           footers: {
             first: coverFooter,
-            default: pageNumberFooter,
+            default: defaultFooter,
           },
           children,
         },
@@ -4348,7 +5001,7 @@ function App() {
     return await Packer.toBlob(doc)
   }
 
-  const previewWordReport = async () => {
+  const previewWordReport = async (): Promise<Blob | null> => {
     // Ensure the latest in-progress draft edits are committed.
     try {
       const el = document.activeElement as HTMLElement | null
@@ -4358,70 +5011,74 @@ function App() {
       // best-effort only
     }
 
+    docxPreviewLastErrorRef.current = ''
     setDocxPreviewError('')
     setDocxPreviewStatus('Building preview…')
 
     const host = docxPreviewHostRef.current
     if (!host) {
-      setDocxPreviewError('Preview host is not available.')
+      const msg = 'Preview host is not available.'
+      docxPreviewLastErrorRef.current = msg
+      setDocxPreviewError(msg)
       setDocxPreviewStatus('')
-      return
+      return null
     }
 
     try {
       const draftToUse = docxDraft.length ? docxDraft : buildDocxDraftFromPaths(normalizeFaultsText(reportText || faultsList.join('\n')), [])
+
+      setDocxPreviewStatus('Generating DOCX…')
       const blob = await buildWordReportBlobFromDraft(draftToUse, { includeRgbPairs: includeRgbInDocx })
-      const arrayBuffer = await blob.arrayBuffer()
-      host.innerHTML = ''
-      const styleHost = docxPreviewStylesRef.current ?? undefined
-      await renderAsync(arrayBuffer, host, styleHost, {
-        inWrapper: true,
-        ignoreWidth: false,
-        ignoreHeight: false,
-        breakPages: true,
+
+      setDocxPreviewStatus('Converting to PDF (LibreOffice)…')
+
+      const form = new FormData()
+      form.append('file', blob, 'report.docx')
+      const resp = await fetch(apiUrl('/api/convert/docx-to-pdf'), {
+        method: 'POST',
+        body: form,
       })
 
-      // docx-preview does not reliably render DOCX headers/footers across all documents.
-      // To ensure pagination is visible in preview (and in PDF export), overlay page numbers on each page.
-      try {
-        const wrapper = host.querySelector('.docx-wrapper') as HTMLElement | null
-        const pages = wrapper ? (Array.from(wrapper.querySelectorAll('section.docx')) as HTMLElement[]) : []
-        for (const page of pages) {
-          page.querySelectorAll('.preview-page-number').forEach((n) => n.remove())
+      if (!resp.ok) {
+        let detail = `${resp.status} ${resp.statusText}`
+        try {
+          const j = (await resp.json()) as any
+          if (j && typeof j.detail === 'string') detail = j.detail
+        } catch {
+          try {
+            const t = (await resp.text()).trim()
+            if (t) detail = t
+          } catch {
+            // ignore
+          }
         }
-        for (let i = 0; i < pages.length; i += 1) {
-          if (i === 0) continue // cover page: no pagination
-          const pageNumber = i // cover is page 0; TOC becomes Page | 1
-          // Ensure the overlay is anchored to the page.
-          pages[i].style.position = pages[i].style.position || 'relative'
-          const el = document.createElement('div')
-          el.className = 'preview-page-number'
-          el.textContent = `Page | ${pageNumber}`
-          // Inline styles so it works even when app CSS selectors don't apply
-          // inside docx-preview's generated DOM.
-          el.style.position = 'absolute'
-          el.style.right = '18px'
-          el.style.bottom = '14px'
-          el.style.zIndex = '50'
-          el.style.fontSize = '10px'
-          el.style.lineHeight = '1'
-          el.style.color = 'rgba(15, 23, 42, 0.65)'
-          el.style.pointerEvents = 'none'
-          el.style.userSelect = 'none'
-          // Keep readable even over dark images.
-          el.style.background = 'rgba(255, 255, 255, 0.72)'
-          el.style.padding = '2px 6px'
-          el.style.borderRadius = '6px'
-          pages[i].appendChild(el)
-        }
-      } catch {
-        // Best-effort only; don't fail preview.
+        throw new Error(detail)
       }
 
+      const pdfBlob = await resp.blob()
+      docxPreviewPdfBlobRef.current = pdfBlob
+      const url = URL.createObjectURL(pdfBlob)
+      if (docxPreviewPdfUrlRef.current) URL.revokeObjectURL(docxPreviewPdfUrlRef.current)
+      docxPreviewPdfUrlRef.current = url
+
+      host.innerHTML = ''
+      const iframe = document.createElement('iframe')
+      iframe.src = url
+      iframe.title = 'PDF preview'
+      iframe.style.width = '100%'
+      iframe.style.height = '100%'
+      iframe.style.border = 'none'
+      host.appendChild(iframe)
+
       setDocxPreviewStatus('Preview updated.')
+      docxPreviewLastErrorRef.current = ''
+      return pdfBlob
     } catch (error) {
-      setDocxPreviewError(error instanceof Error ? error.message : 'Failed to render DOCX preview')
+      const msg = error instanceof Error ? error.message : 'Failed to render DOCX preview'
+      docxPreviewLastErrorRef.current = msg
+      setDocxPreviewError(msg)
       setDocxPreviewStatus('')
+      return null
     }
   }
 
@@ -4473,143 +5130,42 @@ function App() {
     }
 
     setReportError('')
-    setReportStatus('Generating PDF from preview…')
-
-    const waitForImagesIn = async (root: HTMLElement, timeoutMs = 6000) => {
-      const imgs = Array.from(root.querySelectorAll('img')) as HTMLImageElement[]
-      if (imgs.length === 0) return
-
-      const pending = imgs
-        .filter((img) => !(img.complete && img.naturalWidth > 0))
-        .map(
-          (img) =>
-            new Promise<void>((resolve) => {
-              const done = () => {
-                img.removeEventListener('load', done)
-                img.removeEventListener('error', done)
-                resolve()
-              }
-              img.addEventListener('load', done)
-              img.addEventListener('error', done)
-            }),
-        )
-
-      if (pending.length === 0) return
-
-      await Promise.race([
-        Promise.allSettled(pending).then(() => undefined),
-        new Promise<void>((resolve) => window.setTimeout(resolve, timeoutMs)),
-      ])
-    }
+    setReportStatus('Generating PDF…')
 
     try {
-      // Ensure the preview is up-to-date so the PDF matches what the user sees.
-      await previewWordReport()
-
-      // Give fonts a chance to load so measurements match what’s displayed.
-      try {
-        const fonts = (document as any).fonts
-        if (fonts?.ready) await fonts.ready
-      } catch {
-        // best-effort only
-      }
-
-      const host = docxPreviewHostRef.current
-      if (!host) throw new Error('Preview host is not available.')
-
-      const wrapper = host.querySelector('.docx-wrapper') as HTMLElement | null
-      if (!wrapper) throw new Error('DOCX preview is not ready yet. Click “Preview DOCX” first.')
-
-      const pages = Array.from(wrapper.querySelectorAll('section.docx')) as HTMLElement[]
-      const targets = pages.length ? pages : [wrapper]
-
-      const pdf = new jsPDF({ orientation: 'p', unit: 'pt', format: 'a4' })
-      const pdfWidth = pdf.internal.pageSize.getWidth()
-      const pdfHeight = pdf.internal.pageSize.getHeight()
-
-
-      // Mode A (user preference): match the preview pagination exactly.
-      // One preview page => one PDF page. Never shrink to fit height and never
-      // slice into extra pages; any overflow is clipped.
-
-      for (let i = 0; i < targets.length; i++) {
-        const el = targets[i]
-
-        setReportStatus(`Generating PDF… page ${i + 1} / ${targets.length}`)
-
-        // docx-preview may still be loading images asynchronously.
-        await waitForImagesIn(el)
-
-        const canvas = await html2canvas(el, {
-          backgroundColor: '#ffffff',
-          scale: 2,
-          useCORS: true,
-          logging: false,
-        })
-
-        const imgData = canvas.toDataURL('image/jpeg', 0.92)
-
-        // Default: fit to width.
-        let outW = pdfWidth
-        let outH = (canvas.height * outW) / canvas.width
-        let x = 0
-        let y = 0
-
-        // If the rendered preview page is taller than A4, the bottom is clipped.
-        // Scale down to fit height so the page number overlay is always included.
-        if (outH > pdfHeight) {
-          const scaleDown = pdfHeight / outH
-          outW = outW * scaleDown
-          outH = pdfHeight
-          x = (pdfWidth - outW) / 2
-          y = 0
-        }
-
-        if (i > 0) pdf.addPage()
-
-        pdf.addImage(imgData, 'JPEG', x, y, outW, outH)
-      }
+      const pdfBlob = await previewWordReport()
+      if (!pdfBlob) throw new Error(docxPreviewLastErrorRef.current || 'Failed to generate PDF preview.')
 
       const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
       const filename = `faults-report-${stamp}.pdf`
 
-      // Download via Blob+anchor to avoid browsers blocking jsPDF.save() after async work.
-      try {
-        const blob = pdf.output('blob') as Blob
-        const url = URL.createObjectURL(blob)
+      setReportStatus('Downloading PDF…')
+      const url = URL.createObjectURL(pdfBlob)
 
-        const ua = navigator.userAgent || ''
-        const isIOS = /iPad|iPhone|iPod/.test(ua)
-        const isSafari = /Safari\//.test(ua) && !/(Chrome|Chromium|Edg|OPR)\//.test(ua)
+      const ua = navigator.userAgent || ''
+      const isIOS = /iPad|iPhone|iPod/.test(ua)
+      const isSafari = /Safari\//.test(ua) && !/(Chrome|Chromium|Edg|OPR)\//.test(ua)
 
-        // Safari/iOS commonly ignores programmatic downloads; open the PDF viewer instead.
-        if (isIOS || isSafari) {
-          const w = window.open(url, '_blank', 'noopener,noreferrer')
-          if (!w) {
-            setReportError('Popup blocked. Allow popups to open the generated PDF.')
-          }
-          window.setTimeout(() => URL.revokeObjectURL(url), 1500)
-        } else {
-          const a = document.createElement('a')
-          a.href = url
-          a.download = filename
-          document.body.appendChild(a)
-          a.click()
-          a.remove()
-          window.setTimeout(() => URL.revokeObjectURL(url), 1500)
+      // Safari/iOS commonly ignores programmatic downloads; open the PDF viewer instead.
+      if (isIOS || isSafari) {
+        const w = window.open(url, '_blank', 'noopener,noreferrer')
+        if (!w) {
+          setReportError('Popup blocked. Allow popups to open the generated PDF.')
         }
-      } catch {
-        // Fallback.
-        pdf.save(filename)
+        window.setTimeout(() => URL.revokeObjectURL(url), 1500)
+      } else {
+        const a = document.createElement('a')
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        window.setTimeout(() => URL.revokeObjectURL(url), 1500)
       }
       setReportStatus('PDF downloaded.')
     } catch (error) {
-      const msg = error instanceof Error ? error.message : 'Failed to generate PDF from preview'
-      const hint =
-        typeof msg === 'string' && msg.toLowerCase().includes('taint')
-          ? ' (Tip: this can happen if the preview contains cross-origin images without CORS headers.)'
-          : ''
-      setReportError(`${msg}${hint}`)
+      const msg = error instanceof Error ? error.message : 'Failed to generate PDF'
+      setReportError(msg)
       setReportStatus('')
     }
   }
@@ -4664,19 +5220,253 @@ function App() {
 
   const readLabelsForPath = async (path: string) => {
     try {
-      const faultsDir = await getWorkflowFaultsDir(false)
-      if (!faultsDir) return []
-      const labelsDir = await faultsDir.getDirectoryHandle?.('labels')
-      if (!labelsDir) return []
-      const stem = path.split('/').pop()?.replace(/\.[^/.]+$/, '') || path
-      const labelText = await readTextFile(labelsDir, `${stem}.txt`)
-      if (!labelText) return []
+      const normalizedImagePath = normalizePath(String(path || ''))
+      const baseName = normalizedImagePath.split('/').pop() || normalizedImagePath
+      const stem = baseName.replace(/\.[^/.]+$/, '') || baseName
+
+      // Backward-compat: some sessions write label files without the DJI `_T` / `_V` suffix.
+      const baseNameNoTv = baseName.replace(/_[TV](\.[^.]+)$/i, '$1')
+      const stemNoTv = stem.replace(/_[TV]$/i, '')
+
+      // Backward-compat: some older sessions used '<imageNameWithExt>.txt' (e.g. DJI_0001.JPG.txt)
+      // while newer writes use '<stem>.txt' (e.g. DJI_0001.txt).
+      // Additionally, some datasets omit the trailing `_T` / `_V` in label filenames.
+      const candidates = Array.from(
+        new Set(
+          [`${stem}.txt`, `${baseName}.txt`, stemNoTv && `${stemNoTv}.txt`, baseNameNoTv && `${baseNameNoTv}.txt`]
+            .filter(Boolean)
+            .map(String)
+        )
+      )
+
+      // Fast-path: if labels exist in the opened tree, read them directly from `fileMap`.
+      // This avoids brittle directory-handle traversal and guarantees rendering when the files are present.
+      let labelText: string | null = null
+      let matchedPath: string | null = null
+      const tryReadTextFromFileMap = async (candidatePath: string) => {
+        const resolved = resolvePathCaseInsensitive(normalizePath(candidatePath))
+        const file = resolved ? fileMap[resolved] : null
+        if (!file) return null
+        try {
+          return await file.text()
+        } catch {
+          return null
+        }
+      }
+
+      const imageParts = normalizedImagePath.split('/').filter(Boolean)
+      const thermalIdx = imageParts.findIndex((p) => p.toLowerCase() === 'thermal')
+      let sessionPrefix = thermalIdx >= 0 ? imageParts.slice(0, thermalIdx).join('/') : ''
+      if ((!sessionPrefix || thermalIdx === 0) && effectiveThermalFolderPath) {
+        const effParts = effectiveThermalFolderPath.split('/').filter(Boolean)
+        const effThermalIdx = effParts.findIndex((p) => p.toLowerCase() === 'thermal')
+        if (effThermalIdx > 0) {
+          sessionPrefix = effParts.slice(0, effThermalIdx).join('/')
+        }
+      }
+      const sessionPrefixWithSlash = sessionPrefix ? `${sessionPrefix}/` : ''
+
+      const relUnderThermalDir = thermalIdx >= 0 ? imageParts.slice(thermalIdx + 1, -1).join('/') : ''
+      const imageParentPath = getParentDirPath(normalizedImagePath)
+
+      // Support alternate layouts where `workspace/` is stored under `tif/` or `tiff/`.
+      const workspaceRoots = [
+        `${sessionPrefixWithSlash}${WORKSPACE_DIR}/${WORKSPACE_THERMAL_LABELS_DIR}`,
+        `${sessionPrefixWithSlash}tif/${WORKSPACE_DIR}/${WORKSPACE_THERMAL_LABELS_DIR}`,
+        `${sessionPrefixWithSlash}tiff/${WORKSPACE_DIR}/${WORKSPACE_THERMAL_LABELS_DIR}`,
+      ]
+      const legacyRoot = `${sessionPrefixWithSlash}thermal/faults/labels`
+
+      const fileMapCandidates: string[] = []
+      for (const name of candidates) {
+        for (const root of workspaceRoots) {
+          fileMapCandidates.push(`${root}/${name}`)
+          if (relUnderThermalDir) fileMapCandidates.push(`${root}/${relUnderThermalDir}/${name}`)
+        }
+        fileMapCandidates.push(`${legacyRoot}/${name}`)
+        fileMapCandidates.push(`${imageParentPath}/${name}`)
+        if (relUnderThermalDir) {
+          fileMapCandidates.push(`${legacyRoot}/${relUnderThermalDir}/${name}`)
+        }
+      }
+
+      for (const candidatePath of fileMapCandidates) {
+        const text = await tryReadTextFromFileMap(candidatePath)
+        if (text && text.trim()) {
+          labelText = text
+          matchedPath = resolvePathCaseInsensitive(normalizePath(candidatePath)) || normalizePath(candidatePath)
+          break
+        }
+      }
+
+      // Only attempt directory-handle traversal if the file isn't already present in `fileMap`.
+      // (Some environments/sessions may not allow resolving sibling workspace directories reliably.)
+      const workspaceLabelsDir = !labelText
+        ? await getWorkspaceThermalLabelsDirForPath(normalizedImagePath, false).catch(() => null)
+        : null
+
+      const legacyLabelsDirByPath = !labelText
+        ? await (async () => {
+            if (!folderHandle || !folderHandle.getDirectoryHandle) return null
+            const parts = normalizedImagePath.split('/').filter(Boolean)
+            const thermalIdxLocal = parts.findIndex((p) => p.toLowerCase() === 'thermal')
+            if (thermalIdxLocal < 0) return null
+
+            let thermalDir: FileSystemDirectoryHandle = folderHandle
+            for (const part of parts.slice(0, thermalIdxLocal + 1)) {
+              if (!thermalDir.getDirectoryHandle) return null
+              thermalDir = await thermalDir.getDirectoryHandle(part, { create: false })
+            }
+
+            if (!thermalDir.getDirectoryHandle) return null
+            const faults = await thermalDir.getDirectoryHandle('faults', { create: false })
+            if (!faults?.getDirectoryHandle) return null
+            return faults.getDirectoryHandle('labels', { create: false })
+          })().catch(() => null)
+        : null
+
+      const legacyLabelsDirGlobal = !labelText
+        ? await (async () => {
+            const legacyFaultsDir = await getLegacyWorkflowFaultsDir(false)
+            if (!legacyFaultsDir?.getDirectoryHandle) return null
+            try {
+              return await legacyFaultsDir.getDirectoryHandle('labels', { create: false })
+            } catch {
+              return null
+            }
+          })().catch(() => null)
+        : null
+
+      const legacyLabelsDir = !labelText ? (legacyLabelsDirByPath || legacyLabelsDirGlobal) : null
+
+      const readTextFileFlexible = async (dir: FileSystemDirectoryHandle, name: string) => {
+        const direct = await readTextFile(dir, name)
+        if (direct !== null) return direct
+
+        // Case-insensitive fallback: scan directory entries for a matching filename.
+        try {
+          if (!dir.getFileHandle) return null
+          const target = name.toLowerCase()
+          const entriesFn = (dir as any).entries as undefined | (() => AsyncIterableIterator<[string, any]>)
+          if (!entriesFn) return null
+          for await (const [entryName, entry] of entriesFn.call(dir)) {
+            if (!entry || entry.kind !== 'file') continue
+            if (String(entryName).toLowerCase() !== target) continue
+            const fh = await dir.getFileHandle(entryName)
+            const f = await fh.getFile()
+            return await f.text()
+          }
+        } catch {
+          // ignore
+        }
+
+        return null
+      }
+
+      const tryGetSubdir = async (root: FileSystemDirectoryHandle, relPath: string) => {
+        if (!relPath) return root
+        if (!root.getDirectoryHandle) return null
+        const parts = relPath.split('/').filter(Boolean)
+        let dir: FileSystemDirectoryHandle = root
+        for (const part of parts) {
+          if (!dir.getDirectoryHandle) return null
+          try {
+            dir = await dir.getDirectoryHandle(part, { create: false })
+          } catch {
+            return null
+          }
+        }
+        return dir
+      }
+
+      const thermalRoot = effectiveThermalFolderPath
+      const parentPath = getParentDirPath(path)
+      const inferRelUnderThermal = (p: string) => {
+        const normalized = String(p || '')
+        if (!normalized) return ''
+
+        if (thermalRoot && (normalized === thermalRoot || normalized.startsWith(`${thermalRoot}/`))) {
+          return normalized.slice(thermalRoot.length).replace(/^\//, '')
+        }
+
+        // If we don't have a detected thermal root yet, but paths are still prefixed
+        // with a top-level `thermal/`, strip it so nested label folders match.
+        const parts = normalized.split('/').filter(Boolean)
+        if (parts.length > 0 && parts[0].toLowerCase() === 'thermal') {
+          return parts.slice(1).join('/')
+        }
+
+        return normalized
+      }
+
+      const relDir = parentPath ? inferRelUnderThermal(parentPath) : ''
+
+      if (!labelText) {
+        const labelRoots = [workspaceLabelsDir, legacyLabelsDir].filter(Boolean) as FileSystemDirectoryHandle[]
+        for (const root of labelRoots) {
+          // 1) Try flat storage at the root.
+          for (const name of candidates) {
+            labelText = await readTextFileFlexible(root, name)
+            if (labelText) break
+          }
+          if (labelText) break
+
+          // 2) Try nested storage mirroring the thermal folder structure.
+          if (relDir) {
+            const nested = await tryGetSubdir(root, relDir)
+            if (nested) {
+              for (const name of candidates) {
+                labelText = await readTextFileFlexible(nested, name)
+                if (labelText) break
+              }
+            }
+          }
+          if (labelText) break
+        }
+
+        // Final fallback: some datasets store labels alongside the image file itself.
+        // (Read-only; we do not write into `thermal/`.)
+        if (!labelText) {
+          const workflowRoot = await getWorkflowRootDir(false)
+          if (workflowRoot) {
+            const imageRelPath = parentPath ? inferRelUnderThermal(parentPath) : ''
+            const imageDir = await tryGetSubdir(workflowRoot, imageRelPath)
+            if (imageDir) {
+              for (const name of candidates) {
+                labelText = await readTextFileFlexible(imageDir, name)
+                if (labelText) break
+              }
+            }
+          }
+        }
+      }
+
+      if (!labelText) {
+        // Diagnostics: helps confirm we are looking in the correct nested workspace.
+        // (Open DevTools console to view.)
+        console.warn('[labels] not found', {
+          imagePath: normalizedImagePath,
+          effectiveThermalFolderPath,
+          sessionPrefix,
+          candidates,
+          fileMapCandidateCount: fileMapCandidates.length,
+          fileMapCandidateSample: fileMapCandidates.slice(0, 10),
+          hasWorkspaceLabelsDir: Boolean(workspaceLabelsDir),
+          hasLegacyLabelsDir: Boolean(legacyLabelsDir),
+          relDir,
+        })
+        return []
+      }
+
+      if (matchedPath) {
+        console.debug('[labels] loaded', { imagePath: normalizedImagePath, labelPath: matchedPath })
+      }
       const raw = labelText
         .split(/\r?\n/)
         .map((line) => line.trim())
         .filter(Boolean)
         .map((line) => {
-          const [classId, x, y, w, h, conf] = line.split(/\s+/).map(Number)
+          const [classId, x, y, w, h, conf] = line.split(/\s+/).map(parseYoloNumber)
           return {
             classId: Number.isFinite(classId) ? classId : 0,
             x: Number.isFinite(x) ? x : 0,
@@ -4714,9 +5504,38 @@ function App() {
     }
   }
 
+  // When labels are generated externally (scan/backend) after the image is already open,
+  // re-check and load them automatically. To avoid overriding manual edits, only do
+  // this when the user hasn't edited labels yet (history still has the initial empty snapshot).
+  useEffect(() => {
+    if (!selectedPath) return
+    if (!folderHandle) return
+    if (fileKind !== 'image') return
+    if (selectedLabels.length > 0) return
+    if (labelHistoryIndex !== 0) return
+    if (labelHistory.length !== 1) return
+    if ((labelHistory[0] || []).length !== 0) return
+
+    let cancelled = false
+    void (async () => {
+      const labels = await readLabelsForPath(selectedPath)
+      if (cancelled) return
+      if (!labels || labels.length === 0) return
+      setSelectedLabels(labels)
+      setSelectedLabelIndex(null)
+      setLabelHistory([labels])
+      setLabelHistoryIndex(0)
+    })()
+
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fileKind, folderHandle, labelHistory, labelHistoryIndex, selectedLabels.length, selectedPath, workspaceIndexTick])
+
   const readRgbLabelsForRgbPath = async (rgbPath: string) => {
     try {
-      const labelsDir = await getRgbLabelsDir(false)
+      const labelsDir = (await getRgbLabelsDir(false)) || (await getLegacyRgbLabelsDir(false))
       if (!labelsDir) return []
 
       const stem = rgbPath.split('/').pop()?.replace(/\.[^/.]+$/, '') || rgbPath
@@ -4750,7 +5569,7 @@ function App() {
       const crop = getDefaultRgbCropRectNormalizedFromImageDims(width, height)
       if (!crop) return normalized
 
-      // Backward-compat heuristic: older rgb/labels files may already be full-image normalized.
+      // Backward-compat heuristic: older RGB label files may already be full-image normalized.
       const x0 = crop.x0
       const y0 = crop.y0
       const x1 = crop.x0 + crop.scaleX
@@ -4768,12 +5587,17 @@ function App() {
 
   const readMetadataForImagePath = async (imagePath: string) => {
     try {
-      const faultsDir = await getWorkflowFaultsDir(false)
-      if (!faultsDir || !faultsDir.getDirectoryHandle) return null
-      const metadataDir = await faultsDir.getDirectoryHandle('metadata', { create: false })
+      const metadataDir = await getWorkspaceThermalMetadataDir(false)
+      const legacyFaultsDir = !metadataDir ? await getLegacyWorkflowFaultsDir(false) : null
+      const legacyMetadataDir = legacyFaultsDir?.getDirectoryHandle
+        ? await legacyFaultsDir.getDirectoryHandle('metadata', { create: false })
+        : null
+
+      const dir = metadataDir || legacyMetadataDir
+      if (!dir) return null
       const imageName = imagePath.split('/').pop() || imagePath
       const jsonName = `${imageName}.json`
-      return await readJsonFile<any>(metadataDir, jsonName)
+      return await readJsonFile<any>(dir, jsonName)
     } catch {
       return null
     }
@@ -5435,31 +6259,46 @@ function App() {
     setScanStatus('Preparing scan…')
 
     try {
-      const workflowRoot = await getWorkflowRootDir(true)
+      if (openedThermalFolderDirectly) {
+        throw new Error('You opened the “thermal” folder directly. Open the parent folder that contains “thermal/” (and optionally “rgb/”) so the app can create a sibling “workspace/” folder.')
+      }
+      if (openedRgbFolderDirectly) {
+        throw new Error('You opened the “rgb” folder directly. Open the parent folder that contains “thermal/” and “rgb/” so the app can create a sibling “workspace/” folder.')
+      }
+
+      const thermalPath = effectiveThermalFolderPath
+      if (!thermalPath) {
+        throw new Error('Unable to locate a “thermal” folder inside the opened folder. Open the parent folder that contains “thermal/”.')
+      }
+
+      const workflowRoot = await getWorkflowRootDir(false)
       if (!workflowRoot) throw new Error('Unable to access thermal folder')
 
-      const faultsDir = await getFaultsDir(workflowRoot, true)
-      if (!faultsDir) throw new Error('Unable to access faults folder')
+      const faultsDir = await getWorkspaceThermalFaultsDir(true)
+      if (!faultsDir) throw new Error('Unable to access workspace/thermal_faults folder')
+
+      const labelsDir = await getWorkspaceThermalLabelsDir(true)
+      if (!labelsDir) throw new Error('Unable to access workspace/thermal_labels folder')
+
+      const labelsCenterDir = await getWorkspaceThermalLabelsCenterDir(true)
+      if (!labelsCenterDir) throw new Error('Unable to access workspace/thermal_labels_center folder')
+
+      const metadataDir = await getWorkspaceThermalMetadataDir(true)
+      if (!metadataDir) throw new Error('Unable to access workspace/thermal_metadata folder')
+
+      const temperaturesCsvDir = await getWorkspaceThermalTemperaturesCsvsDir(true)
+      if (!temperaturesCsvDir) throw new Error('Unable to access workspace/thermal_temperatures_csvs folder')
 
       if (overwrite) {
         await clearDirectory(faultsDir)
+        await clearDirectory(labelsDir)
+        await clearDirectory(labelsCenterDir)
+        await clearDirectory(metadataDir)
+        await clearDirectory(temperaturesCsvDir)
         setStarredFaults({})
         setOnlyStarredInReport(false)
         await writeTextFile(faultsDir, STARRED_FILE, '')
-        await writeTextFile(workflowRoot, STARRED_FILE, '')
       }
-
-      const labelsDir = await faultsDir.getDirectoryHandle?.('labels', { create: true })
-      if (!labelsDir) throw new Error('Unable to create labels folder')
-
-      const labelsCenterDir = await faultsDir.getDirectoryHandle?.('labels_center', { create: true })
-      if (!labelsCenterDir) throw new Error('Unable to create labels_center folder')
-
-      const metadataDir = await faultsDir.getDirectoryHandle?.('metadata', { create: true })
-      if (!metadataDir) throw new Error('Unable to create metadata folder')
-
-      const temperaturesCsvDir = await faultsDir.getDirectoryHandle?.('temperatures_csvs', { create: true })
-      if (!temperaturesCsvDir) throw new Error('Unable to create temperatures_csvs folder')
 
       const buildTiffIndex = () => {
         const isTiff = (p: string) => {
@@ -5563,7 +6402,17 @@ function App() {
         )
       }
 
-      const existingText = overwrite ? '' : (await readTextFile(faultsDir, 'faults.txt')) || ''
+      const existingText = overwrite
+        ? ''
+        : (await readTextFile(faultsDir, 'faults.txt'))
+          || (await (async () => {
+            const legacyFaultsDir = await getLegacyWorkflowFaultsDir(false)
+            const legacy = legacyFaultsDir ? await readTextFile(legacyFaultsDir, 'faults.txt') : null
+            if (legacy) return legacy
+            const legacyRoot = await getWorkflowRootDir(false)
+            return legacyRoot ? await readTextFile(legacyRoot, 'faults.txt') : null
+          })())
+          || ''
       const existingSet = new Set(
         existingText
           .split(/\r?\n/)
@@ -5661,7 +6510,7 @@ function App() {
           .map((line) => line.trim())
           .filter(Boolean)
           .map((line) => {
-            const [classId, x, y, w, h, conf] = line.split(/\s+/).map(Number)
+            const [classId, x, y, w, h, conf] = line.split(/\s+/).map(parseYoloNumber)
             return {
               classId: Number.isFinite(classId) ? classId : 0,
               x: Number.isFinite(x) ? x : 0,
@@ -5685,7 +6534,6 @@ function App() {
 
       const merged = [...existingSet]
       await writeTextFile(faultsDir, 'faults.txt', merged.join('\n'))
-      await writeTextFile(workflowRoot, 'faults.txt', merged.join('\n'))
 
       await writeCenterFaultFlags(faultsDir, nextCenterFlags)
       setCenterFaultFlags(nextCenterFlags)
@@ -5693,6 +6541,23 @@ function App() {
       setFaultsList(merged)
       setScanCompleted(true)
       setScanStatus(`Scan completed . Faults found: ${detected.length}`)
+
+      // Refresh the in-memory file tree so newly created workspace files become visible
+      // without requiring the user to reopen the folder.
+      await refreshFolderEntries(folderHandle)
+
+      // If the user currently has an image open with no loaded labels, try reloading
+      // now that scan outputs exist on disk.
+      if (selectedPath && fileKind === 'image' && selectedLabelsRef.current.length === 0) {
+        const next = await readLabelsForPath(selectedPath)
+        if (next.length > 0) {
+          selectedLabelsRef.current = next
+          setSelectedLabels(next)
+          setSelectedLabelIndex(null)
+          setLabelHistory([next])
+          setLabelHistoryIndex(0)
+        }
+      }
     } catch (error) {
       setScanError(error instanceof Error ? error.message : 'Scan failed')
       setScanStatus('')
@@ -5817,43 +6682,69 @@ function App() {
     setFileKind('other')
   }
 
-  const rootNode = useMemo(() => {
-    if (!fileTree?.children?.length) return null
+  const displayedRootPath = useMemo(() => {
+    if (effectiveThermalFolderPath) return getParentDirPath(effectiveThermalFolderPath)
+    if (!fileTree?.children?.length) return ''
     const stack: TreeNode[] = [...fileTree.children]
     while (stack.length > 0) {
       const node = stack.shift()!
-      if (node.type === 'folder' && node.name.toLowerCase() === 'thermal') return node
+      if (node.type === 'folder' && node.name.toLowerCase() === 'thermal') {
+        return getParentDirPath(node.path)
+      }
       if (node.type === 'folder' && node.children && node.children.length > 0) {
         stack.unshift(...node.children)
       }
     }
-    return fileTree.children.find((node) => node.type === 'folder') ?? null
-  }, [fileTree])
+    return ''
+  }, [effectiveThermalFolderPath, fileTree])
+
+  const displayedRootNode = useMemo(() => {
+    if (!fileTree?.children?.length) return null
+    const target = displayedRootPath
+    if (!target) return fileTree
+    const stack: TreeNode[] = [...fileTree.children]
+    while (stack.length > 0) {
+      const node = stack.shift()!
+      if (node.type === 'folder' && node.path === target) return node
+      if (node.type === 'folder' && node.children && node.children.length > 0) {
+        stack.unshift(...node.children)
+      }
+    }
+    return fileTree
+  }, [displayedRootPath, fileTree])
 
   const rootLabel = useMemo(() => {
     if (!fileTree?.children?.length) return 'No folder selected'
-    if (rootNode && rootNode.type === 'folder' && rootNode.name.toLowerCase() === 'thermal') {
-      const parentPath = getParentDirPath(rootNode.path)
-      const parentName = parentPath.split('/').filter(Boolean).pop()
-      if (parentName) return parentName
-      // If `thermal/` is at the top level, show the workspace folder name instead of "thermal".
-      if (folderHandle?.name) return folderHandle.name
-    }
-    return rootNode ? rootNode.name : 'Folder'
-  }, [fileTree, folderHandle?.name, rootNode])
+    if (!displayedRootPath) return folderHandle?.name || 'project'
+    return displayedRootPath.split('/').filter(Boolean).pop() || folderHandle?.name || 'project'
+  }, [displayedRootPath, fileTree, folderHandle?.name])
 
   const rootChildren = useMemo(() => {
-    if (rootNode) return rootNode.children ?? []
-    return fileTree?.children ?? []
-  }, [fileTree, rootNode])
+    if (!fileTree?.children?.length) return []
+    if (!displayedRootNode) return []
+    return displayedRootNode.children ?? []
+  }, [displayedRootNode, fileTree])
+
+  useEffect(() => {
+    if (!fileTree?.children?.length) return
+    const workspacePath = displayedRootPath ? `${displayedRootPath}/workspace` : 'workspace'
+    setExpandedPaths((prev) => {
+      const next = new Set(prev)
+      next.add('')
+      next.add(workspacePath)
+      return next
+    })
+  }, [displayedRootPath, fileTree])
 
   const hasFolderSelected = useMemo(
-    () => Boolean(fileTree && (rootNode || (fileTree.children && fileTree.children.length > 0))),
-    [fileTree, rootNode]
+    () => Boolean(fileTree && (rootChildren.length > 0 || (fileTree.children && fileTree.children.length > 0))),
+    [fileTree, rootChildren.length]
   )
 
   const showLeftExplorer = hasFolderSelected && (activeMenu === 'file' || (activeMenu === 'actions' && activeAction === 'view'))
   const showRightExplorer = hasFolderSelected && activeMenu === 'actions' && activeAction === 'view'
+  const isViewExplorer = activeMenu === 'actions' && activeAction === 'view'
+  const isHomePage = activeMenu === 'file'
 
   const gridTemplateColumns = showLeftExplorer && showRightExplorer
     ? `${isExplorerMinimized ? 0 : explorerWidth}px 1fr ${isRightExplorerMinimized ? 0 : rightExplorerWidth}px`
@@ -5929,21 +6820,27 @@ function App() {
     }
 
     try {
-      const workflowRoot = await getWorkflowRootDir(true)
-      if (!workflowRoot) throw new Error('Unable to access thermal folder')
-      const faultsDir = await getFaultsDir(workflowRoot, true)
-      if (faultsDir) {
-        await writeTextFile(faultsDir, 'faults.txt', nextFaults.join('\n'))
-
-        const { flags } = await readCenterFlagsDisk(faultsDir)
-        if (flags[path] !== undefined) {
-          const nextFlags = { ...flags }
-          delete nextFlags[path]
-          await writeCenterFaultFlags(faultsDir, nextFlags)
-          setCenterFaultFlags(nextFlags)
-        }
+      const faultsDir = await getWorkspaceThermalFaultsDir(true)
+      if (!faultsDir) {
+        throw new Error(
+          openedThermalFolderDirectly
+            ? 'You opened the “thermal” folder directly. Open the parent folder that contains “thermal/” so the app can create a sibling “workspace/” folder.'
+            : openedRgbFolderDirectly
+              ? 'You opened the “rgb” folder directly. Open the parent folder that contains “thermal/” (and “rgb/”) so the app can create a sibling “workspace/” folder.'
+              : 'Open the parent folder that contains “thermal/” so the app can create a sibling “workspace/” folder.'
+        )
       }
-      await writeTextFile(workflowRoot, 'faults.txt', nextFaults.join('\n'))
+
+      await writeTextFile(faultsDir, 'faults.txt', nextFaults.join('\n'))
+
+      // Keep center_flags.json in sync.
+      const { flags } = await readCenterFlagsDisk(faultsDir)
+      if (flags[path] !== undefined) {
+        const nextFlags = { ...flags }
+        delete nextFlags[path]
+        await writeCenterFaultFlags(faultsDir, nextFlags)
+        setCenterFaultFlags(nextFlags)
+      }
     } catch (error) {
       window.alert(error instanceof Error ? error.message : 'Failed to update faults list')
     }
@@ -5996,26 +6893,24 @@ function App() {
       if (!isFolder && faultsList.includes(node.path)) {
         const nextFaults = faultsList.filter((p) => p !== node.path)
         setFaultsList(nextFaults)
-        const workflowRoot = await getWorkflowRootDir(true)
-        const faultsDir = workflowRoot ? await getFaultsDir(workflowRoot, true) : null
+        const faultsDir = await getWorkspaceThermalFaultsDirForPath(node.path, true)
         if (faultsDir) {
           await writeTextFile(faultsDir, 'faults.txt', nextFaults.join('\n'))
         }
-        if (workflowRoot) await writeTextFile(workflowRoot, 'faults.txt', nextFaults.join('\n'))
       }
 
       if (!isFolder) {
-        const faultsDir = await getWorkflowFaultsDir(false)
-        const labelsDir = faultsDir ? await faultsDir.getDirectoryHandle?.('labels') : null
+        const labelsDir = await getWorkspaceThermalLabelsDirForPath(node.path, false)
         if (labelsDir?.removeEntry) {
           await labelsDir.removeEntry(getLabelFileName(node.path)).catch(() => undefined)
         }
 
-        const labelsCenterDir = faultsDir ? await faultsDir.getDirectoryHandle?.('labels_center') : null
+        const labelsCenterDir = await getWorkspaceThermalLabelsCenterDirForPath(node.path, false)
         if (labelsCenterDir?.removeEntry) {
           await labelsCenterDir.removeEntry(getLabelFileName(node.path)).catch(() => undefined)
         }
 
+        const faultsDir = await getWorkspaceThermalFaultsDirForPath(node.path, false)
         if (faultsDir) {
           const { flags } = await readCenterFlagsDisk(faultsDir)
           if (flags[node.path] !== undefined) {
@@ -6078,7 +6973,7 @@ function App() {
 
   const persistLabels = async (labels: Array<{ classId: number; x: number; y: number; w: number; h: number; conf: number; source?: 'auto' | 'manual' }>) => {
     try {
-      // Thermal labels are persisted to `faults/labels/...`.
+      // Thermal labels are persisted to `workspace/thermal_labels/...`.
       // RGB labels must remain independent and are saved only via the RGB export button.
       if (viewVariant === 'rgb' && selectedViewPath && selectedPath && selectedViewPath !== selectedPath) return
       if (!folderHandle || !folderHandle.getDirectoryHandle || !selectedPath) return
@@ -6089,15 +6984,22 @@ function App() {
         return
       }
 
-      const workflowRoot = await getWorkflowRootDir(true)
-      if (!workflowRoot) throw new Error('Unable to access thermal folder')
-      const faultsDir = await getFaultsDir(workflowRoot, true)
-      if (!faultsDir) throw new Error('Unable to access faults folder')
-      const labelsDir = await faultsDir.getDirectoryHandle?.('labels', { create: true })
-      if (!labelsDir) throw new Error('Unable to access labels folder')
+      const faultsDir = await getWorkspaceThermalFaultsDir(true)
+      if (!faultsDir) {
+        throw new Error(
+          openedThermalFolderDirectly
+            ? 'You opened the “thermal” folder directly. Open the parent folder that contains “thermal/” so the app can create a sibling “workspace/” folder.'
+            : openedRgbFolderDirectly
+              ? 'You opened the “rgb” folder directly. Open the parent folder that contains “thermal/” (and “rgb/”) so the app can create a sibling “workspace/” folder.'
+              : 'Open the parent folder that contains “thermal/” so the app can create a sibling “workspace/” folder.'
+        )
+      }
 
-      const labelsCenterDir = await faultsDir.getDirectoryHandle?.('labels_center', { create: true })
-      if (!labelsCenterDir) throw new Error('Unable to access labels_center folder')
+      const labelsDir = await getWorkspaceThermalLabelsDirForPath(selectedPath, true)
+      if (!labelsDir) throw new Error('Unable to access workspace/thermal_labels folder')
+
+      const labelsCenterDir = await getWorkspaceThermalLabelsCenterDirForPath(selectedPath, true)
+      if (!labelsCenterDir) throw new Error('Unable to access workspace/thermal_labels_center folder')
 
       const lines = labels.map((label) =>
         `${label.classId} ${label.x} ${label.y} ${label.w} ${label.h} ${Number.isFinite(label.conf) ? label.conf : 1}`
@@ -6129,14 +7031,12 @@ function App() {
           const nextFaults = [...faultsList, selectedPath]
           setFaultsList(nextFaults)
           await writeTextFile(faultsDir, 'faults.txt', nextFaults.join('\n'))
-          await writeTextFile(workflowRoot, 'faults.txt', nextFaults.join('\n'))
         }
       } else {
         if (faultsList.includes(selectedPath)) {
           const nextFaults = faultsList.filter((path) => path !== selectedPath)
           setFaultsList(nextFaults)
           await writeTextFile(faultsDir, 'faults.txt', nextFaults.join('\n'))
-          await writeTextFile(workflowRoot, 'faults.txt', nextFaults.join('\n'))
         }
       }
 
@@ -6229,7 +7129,7 @@ function App() {
       }
 
       const labelsDir = await ensureRgbLabelsDir()
-      if (!labelsDir) throw new Error('Unable to access rgb/labels folder')
+      if (!labelsDir) throw new Error('Unable to access workspace/rgb_labels folder')
 
       const outName = `${stem}.txt`
 
@@ -6513,7 +7413,7 @@ function App() {
     const crop = getRgbCropRectNormalized(viewportRect, imgRect)
     if (!crop) return
 
-    // Backward-compat: older rgb/labels files may already be full-image normalized.
+    // Backward-compat: older RGB label files may already be full-image normalized.
     // Heuristic: if almost all centers already fall inside the crop rect in full-image
     // coords, treat the file as full-image to avoid shrink/shift.
     const x0 = crop.x0
@@ -7036,10 +7936,22 @@ function App() {
               </button>
               {openMenu === 'help' && (
                 <div className="dropdown">
-                  <button className="dropdown-item" onClick={() => setActiveMenu('help')}>
+                  <button
+                    className="dropdown-item"
+                    onClick={() => {
+                      setActiveHelpPage('documentation')
+                      setActiveMenu('help')
+                    }}
+                  >
                     Documentation
                   </button>
-                  <button className="dropdown-item" onClick={() => setActiveMenu('help')}>
+                  <button
+                    className="dropdown-item"
+                    onClick={() => {
+                      setActiveHelpPage('about')
+                      setActiveMenu('help')
+                    }}
+                  >
                     About
                   </button>
                 </div>
@@ -7079,7 +7991,7 @@ function App() {
               </div>
               {!isExplorerMinimized && (
                 <>
-                  <div className="explorer-pane explorer-pane-tree">
+                  <div className={`explorer-pane explorer-pane-tree ${isHomePage ? 'explorer-pane-tree-full' : ''}`}>
                     <div className="tree">
                       <button
                         className="tree-item folder root"
@@ -7091,7 +8003,7 @@ function App() {
                       {expandedPaths.has('') && sortNodes(rootChildren).map((child) => renderTree(child, 1))}
                     </div>
                   </div>
-                  {faultsListImagePaths.length > 0 && (
+                  {isViewExplorer && faultsListImagePaths.length > 0 && (
                     <>
                       <div className="explorer-pane">
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
@@ -7208,7 +8120,7 @@ function App() {
                 <div className="home-hero-text">
                   <span className="home-badge">Workspace</span>
                   <h1 id="welcome-header">Welcome</h1>
-                  <p style={{ color: '#314157' }}>Open a folder to browse files and preview their contents.</p>
+                  <p>Open a folder to browse files and preview their contents.</p>
                   <div className="home-actions">
                     <button
                       className="link-button"
@@ -7246,9 +8158,9 @@ function App() {
                 <div className="home-hero-card">
                   <div className="home-hero-title">Quick tips</div>
                   <ul>
-                    <li>Use File → Open Folder…</li>
-                    <li>Explore images and text files</li>
-                    <li>Preview updates instantly</li>
+                    <li>Choose a folder to get started → This folder must contain three folders with exact names: rgb, thermal and tiff</li>
+                    <li>Then click "Scan for faults" to proceed to the scan page or choose Actions→Scanner</li>
+                    <li>You can always use Actions→View page. Without scanning, you won't see any faults e.t.c.</li>
                   </ul>
                 </div>
               </div>
@@ -7272,7 +8184,7 @@ function App() {
                         title={selectedViewPath || selectedPath}
                       >
                         <span className="view-filename-name">{(selectedViewPath || selectedPath).split('/').pop() || (selectedViewPath || selectedPath)}</span>
-                        {fileKind === 'image' && viewHoverPixel && viewHoverTempsStatus === 'ready' && (
+                        {fileKind === 'image' && selectedViewPath === selectedPath && viewHoverPixel && viewHoverTempsStatus === 'ready' && (
                           <span className="view-filename-temp" title={`x=${viewHoverPixel.x}, y=${viewHoverPixel.y}`}>
                             {Number.isFinite(viewHoverPixelTempC as number) ? `${(viewHoverPixelTempC as number).toFixed(2)} °C` : 'N/A'}
                           </span>
@@ -8079,70 +8991,86 @@ function App() {
               )}
               {activeAction === 'report' && (
                 <div className="report-panel">
-                  <p style={{ marginTop: 0 }}>
+                  {/* <p style={{ marginTop: 0 }}>
                     Edit <strong>faults.txt</strong> (one image path per line). This does not delete images; it only updates the list.
-                  </p>
+                  </p> */}
                   <div className="report-toolbar">
                     {/* <button className="link-button" onClick={() => loadReportFromDisk()}>
                       Reload
                     </button> */}
+
                     <button
                       className="link-button"
-                      onClick={() => {
-                        const normalized = normalizeFaultsText((docxDraft.length ? docxDraft.map((d) => d.path) : normalizeFaultsText(reportText)).join('\n'))
-                        setReportText(normalized.join('\n'))
-                        const printable = filterPathsForReport(normalized)
-                        setDocxDraft((prev) => buildDocxDraftFromPaths(printable, prev))
-                      }}
+                      onClick={() => setReportAdvancedOpen((prev) => !prev)}
+                      title={reportAdvancedOpen ? 'Hide advanced report actions' : 'Show advanced report actions'}
                     >
-                      Normalize
+                      Advanced
                     </button>
-                    <button className="link-button" onClick={() => saveReportToDisk()}>
-                      Save
+
+                    {reportAdvancedOpen && (
+                      <>
+                        <button
+                          className="link-button"
+                          onClick={() => {
+                            const normalized = normalizeFaultsText((docxDraft.length ? docxDraft.map((d) => d.path) : normalizeFaultsText(reportText)).join('\n'))
+                            setReportText(normalized.join('\n'))
+                            const printable = filterPathsForReport(normalized)
+                            setDocxDraft((prev) => buildDocxDraftFromPaths(printable, prev))
+                          }}
+                          title="Normalize and de-duplicate the report image list"
+                        >
+                          Normalize list
+                        </button>
+                        <button className="link-button" onClick={() => saveReportToDisk()} title="Save the current list to workspace/thermal_faults/faults.txt">
+                          Save list
+                        </button>
+                        <button className="link-button" onClick={() => syncDocxDraftFromEditor()} title="Rebuild the editable DOCX draft from the current list">
+                          Sync draft
+                        </button>
+                        <button className="link-button" onClick={() => void refreshReportMetadataTables()} title="Recompute and refresh metadata tables in the draft">
+                          Refresh metadata
+                        </button>
+                      </>
+                    )}
+
+                    <button className="link-button" onClick={() => previewWordReport()} title="Generate an in-app DOCX preview">
+                      Preview
                     </button>
+                    <button className="link-button" onClick={() => downloadWordReport()} title="Download the report as a .docx file">
+                      Download DOCX
+                    </button>
+                    <button className="link-button" onClick={() => downloadPdfFromPreview()} title="Download the report as a PDF (uses the preview renderer)">
+                      Download PDF
+                    </button>
+
                     <label
                       style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginLeft: 8 }}
-                      title={`When enabled, the DOCX draft will include only images with at least one label inside the ${CENTER_BOX_W}×${CENTER_BOX_H} center box`}
+                      title={`Include only images with at least one label inside the ${CENTER_BOX_W}×${CENTER_BOX_H} center box`}
                     >
                       <input
                         type="checkbox"
                         checked={onlyCenterBoxFaults}
                         onChange={(e) => handleToggleOnlyCenterBoxFaults(e.target.checked)}
                       />
-                      Center box only
+                      Centered
                     </label>
                     <label
                       style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginLeft: 8 }}
-                      title="When enabled, the DOCX draft will include only starred images"
+                      title="Include only starred images in the report"
                     >
                       <input
                         type="checkbox"
                         checked={onlyStarredInReport}
                         onChange={(e) => handleToggleOnlyStarredInReport(e.target.checked)}
                       />
-                      Starred only
+                      Starred
                     </label>
-                    <button className="link-button" onClick={() => syncDocxDraftFromEditor()}>
-                      Sync DOCX draft
-                    </button>
-                    <button className="link-button" onClick={() => void refreshReportMetadataTables()}>
-                      Refresh metadata
-                    </button>
-                    <button className="link-button" onClick={() => previewWordReport()}>
-                      Preview DOCX
-                    </button>
-                    <button className="link-button" onClick={() => downloadWordReport()}>
-                      Download DOCX
-                    </button>
-                    <button className="link-button" onClick={() => downloadPdfFromPreview()}>
-                      Download PDF
-                    </button>
                   </div>
                   <div ref={reportSplitRef} className="report-split">
                     <div className="report-left">
-                      <div className="report-left-stack">
-                        <div className="report-left-window">
-                          <div className="report-sidebar-title">Description</div>
+                      <div className="report-left-window report-left-window-combined">
+                        <div className="report-left-section">
+                          <div className="report-sidebar-title explorer-pane-title">Description</div>
                           <div className="report-sidebar-subtitle">Add one or more description blocks (included in the DOCX)</div>
 
                           <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
@@ -8187,8 +9115,8 @@ function App() {
                           </div>
                         </div>
 
-                        <div className="report-left-window">
-                          <div className="report-sidebar-title">Equipment</div>
+                        <div className="report-left-section">
+                          <div className="report-sidebar-title explorer-pane-title">Equipment</div>
                           <div className="report-sidebar-subtitle">Add equipment entries (title, description, optional image) (included in the DOCX)</div>
 
                           <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 }}>
@@ -8258,8 +9186,8 @@ function App() {
                     <div className="report-main">
                       <div className="docx-preview">
                         <div className="docx-preview-header">
-                          <strong>DOCX preview</strong>
-                          <span className="docx-preview-hint">(rendered in browser; final layout may differ slightly in Word)</span>
+                          <strong>PDF preview</strong>
+                          <span className="docx-preview-hint">(generated via LibreOffice; matches downloaded PDF)</span>
                         </div>
                         {docxPreviewStatus && <div className="report-status">{docxPreviewStatus}</div>}
                         {docxPreviewError && <div className="report-error">{docxPreviewError}</div>}
@@ -8272,7 +9200,7 @@ function App() {
 
                     <div className="report-sidebar" style={{ width: reportDraftWidth }}>
                       <div className="report-sidebar-window">
-                        <div className="report-sidebar-title">DOCX draft</div>
+                        <div className="report-sidebar-title explorer-pane-title">DOCX draft</div>
                         <div className="report-sidebar-subtitle">Edit captions/fields/order before export</div>
                         <label
                           style={{ display: 'inline-flex', alignItems: 'center', gap: 6, margin: '4px 0 10px 0' }}
@@ -8422,7 +9350,326 @@ function App() {
             </section>
           )}
 
-          {activeMenu !== 'file' && activeMenu !== 'actions' && (
+          {activeMenu === 'help' && (
+            <section className="card card-help">
+              <div className="page-header-row">
+                <h2>
+                  {activeHelpPage === 'about'
+                    ? helpLang === 'en'
+                      ? 'About'
+                      : 'About'
+                    : helpLang === 'en'
+                      ? 'Documentation'
+                      : 'Documentation'}
+                </h2>
+                <div className="page-header-right">
+                  <div className="help-tabs">
+                    {activeHelpPage === 'documentation' ? (
+                      <button
+                        className="link-button"
+                        onClick={() => setActiveHelpPage('about')}
+                        type="button"
+                        title={helpLang === 'en' ? 'Application information' : 'Πληροφορίες εφαρμογής'}
+                      >
+                        About
+                      </button>
+                    ) : (
+                      <button
+                        className="link-button"
+                        onClick={() => setActiveHelpPage('documentation')}
+                        type="button"
+                        title={helpLang === 'en' ? 'How to use the application' : 'Οδηγός χρήσης'}
+                      >
+                        Documentation
+                      </button>
+                    )}
+
+                    <div className="help-lang">
+                      {helpLang === 'en' ? (
+                        <button
+                          className="link-button help-lang-button"
+                          onClick={() => setHelpLang('el')}
+                          type="button"
+                          title="Ελληνικά"
+                        >
+                          EL
+                        </button>
+                      ) : (
+                        <button
+                          className="link-button help-lang-button"
+                          onClick={() => setHelpLang('en')}
+                          type="button"
+                          title="English"
+                        >
+                          EN
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {activeHelpPage === 'documentation' ? (
+                <div className="help-doc-scroll">
+                  <div className="help-doc">
+                    <p className="help-lead">
+                      {helpLang === 'en'
+                        ? 'This guide explains, in simple steps, how to use the application to view Thermal/RGB images, manage labels, and create reports.'
+                        : 'Αυτός ο οδηγός εξηγεί με απλά βήματα πώς να χρησιμοποιείτε την εφαρμογή για προβολή θερμικών/RGB εικόνων, επισήμανση (labels) και δημιουργία report.'}
+                    </p>
+
+                    <h3 id="doc-start">
+                      {helpLang === 'en' ? '1) Getting started (Choose folder)' : '1) Ξεκίνημα (Επιλογή φακέλου)'}
+                    </h3>
+                    <ol>
+                      <li>
+                        {helpLang === 'en' ? (
+                          <>
+                            Click <b>Home → Choose Folder...</b> and select the <b>parent</b> folder that contains <b>exactly</b> these subfolders:
+                            <b> rgb</b>, <b>thermal</b>, <b>tiff</b>.
+                          </>
+                        ) : (
+                          <>
+                            Πατήστε <b>Home → Choose Folder...</b> και επιλέξτε τον <b>φάκελο parent</b> που περιέχει <b>ακριβώς</b> τους υποφακέλους:
+                            <b> rgb</b>, <b>thermal</b>, <b>tiff</b>.
+                          </>
+                        )}
+                      </li>
+                      <li>
+                        {helpLang === 'en'
+                          ? 'When asked for folder access (Windows/Browser prompt), choose Allow.'
+                          : 'Όταν σας ζητηθεί άδεια πρόσβασης (Windows/Browser prompt), επιλέξτε Allow.'}
+                      </li>
+                      <li>
+                        {helpLang === 'en'
+                          ? 'The application uses/updates a workspace folder for generated files (labels, lists, etc.).'
+                          : 'Η εφαρμογή χρησιμοποιεί/ενημερώνει έναν φάκελο workspace για τα παραγόμενα αρχεία (labels, λίστες κ.λπ.).'}
+                      </li>
+                    </ol>
+
+                    <h3 id="doc-explorer">{helpLang === 'en' ? '2) Explorer (Left)' : '2) Explorer (Αριστερά)'}</h3>
+                    <ul>
+                      <li>{helpLang === 'en' ? 'Select images/files from here.' : 'Από εδώ επιλέγετε εικόνες/αρχεία.'}</li>
+                      <li>
+                        {helpLang === 'en' ? (
+                          <>
+                            On the <b>View</b> page you will also see the <b>Fault labels</b> list (right side) for the selected image.
+                          </>
+                        ) : (
+                          <>
+                            Στη σελίδα <b>View</b> θα δείτε και τη λίστα <b>Fault labels</b> (δεξιά) για τη συγκεκριμένη εικόνα.
+                          </>
+                        )}
+                      </li>
+                    </ul>
+
+                    <h3 id="doc-view">{helpLang === 'en' ? '3) View (Preview & labels)' : '3) View (Προβολή & Labels)'}</h3>
+                    <ul>
+                      <li>
+                        {helpLang === 'en'
+                          ? 'Go to Actions → View and select a thermal image from the Explorer.'
+                          : 'Πηγαίνετε Actions → View και επιλέξτε μία θερμική εικόνα από τον Explorer.'}
+                      </li>
+                      <li>
+                        {helpLang === 'en' ? 'Using the toolbar above the image, you can:' : 'Με τα κουμπιά πάνω από την εικόνα μπορείτε να:'}
+                        <ul>
+                          <li>{helpLang === 'en' ? <><b>Zoom</b> (+/−) and reset to 100%.</> : <><b>Zoom</b> (+/−) και επαναφορά στο 100%.</>}</li>
+                          <li>
+                            {helpLang === 'en'
+                              ? <><b>Show/Hide labels</b> to toggle overlays.</>
+                              : <><b>Show/Hide labels</b> για να εμφανίζονται/κρύβονται τα overlays.</>}
+                          </li>
+                          <li>
+                            {helpLang === 'en'
+                              ? <>Switch <b>Thermal ↔ RGB</b> (when a matching RGB image exists).</>
+                              : <>Εναλλαγή <b>Thermal ↔ RGB</b> (όπου υπάρχει αντίστοιχη RGB εικόνα).</>}
+                          </li>
+                        </ul>
+                      </li>
+                      <li>
+                        {helpLang === 'en' ? (
+                          <>
+                            Labels are saved to a <b>.txt</b> file inside <b>workspace</b> and appear automatically in the right panel.
+                          </>
+                        ) : (
+                          <>
+                            Τα labels αποθηκεύονται σε αρχείο <b>.txt</b> μέσα στο <b>workspace</b> και εμφανίζονται αυτόματα στο δεξί panel.
+                          </>
+                        )}
+                      </li>
+                    </ul>
+
+                    <h3 id="doc-scan">{helpLang === 'en' ? '4) Scanner (Find faults)' : '4) Scanner (Εντοπισμός faults)'}</h3>
+                    <ol>
+                      <li>{helpLang === 'en' ? <>Go to <b>Actions → Scanner</b>.</> : <>Πηγαίνετε <b>Actions → Scanner</b>.</>}</li>
+                      <li>{helpLang === 'en' ? <>Click <b>Scan</b> and wait for it to finish.</> : <>Πατήστε <b>Scan</b> και περιμένετε να ολοκληρωθεί.</>}</li>
+                      <li>
+                        {helpLang === 'en'
+                          ? <>After scanning, faults/labels become available and you can review them in <b>View</b>.</>
+                          : <>Μετά το scan, εμφανίζονται τα faults/labels και μπορείτε να τα δείτε στο <b>View</b>.</>}
+                      </li>
+                    </ol>
+
+                    <h3 id="doc-report">{helpLang === 'en' ? '5) Report (Compose & export)' : '5) Report (Σύνταξη & Export)'}</h3>
+                    <ul>
+                      <li>{helpLang === 'en' ? <>Go to <b>Actions → Report</b>.</> : <>Πηγαίνετε <b>Actions → Report</b>.</>}</li>
+                      <li>
+                        {helpLang === 'en'
+                          ? <>Use the filters (e.g. <b>Starred</b>) to build the list that goes into the report.</>
+                          : <>Χρησιμοποιήστε τα φίλτρα (π.χ. <b>Starred</b>) για να φτιάξετε τη λίστα που θα μπει στο report.</>}
+                      </li>
+                      <li>
+                        {helpLang === 'en'
+                          ? <>In Report you can add notes/descriptions and export to a file (DOCX/PDF depending on the available buttons).</>
+                          : <>Στο report μπορείτε να κρατάτε σημειώσεις/περιγραφές και να κάνετε export σε αρχείο (DOCX/PDF ανάλογα με τα κουμπιά).</>}
+                      </li>
+                    </ul>
+
+                    <h3 id="doc-tips">{helpLang === 'en' ? '6) Common issues / tips' : '6) Συχνά θέματα / Tips'}</h3>
+                    <ul>
+                      <li>
+                        {helpLang === 'en' ? (
+                          <>
+                            <b>I cannot see labels:</b> make sure you opened the parent folder (the one containing <b>rgb/thermal/tiff</b> and <b>workspace</b>).
+                          </>
+                        ) : (
+                          <>
+                            <b>Δεν βλέπω labels:</b> ελέγξτε ότι ανοίξατε τον φάκελο parent (αυτόν που περιέχει τα <b>rgb/thermal/tiff</b> και το <b>workspace</b>).
+                          </>
+                        )}
+                      </li>
+                      <li>
+                        {helpLang === 'en' ? (
+                          <>
+                            <b>It does not ask/keep permissions:</b> prefer <b>Microsoft Edge</b> or <b>Google Chrome</b>.
+                          </>
+                        ) : (
+                          <>
+                            <b>Δεν ζητάει/δεν κρατάει άδεια:</b> προτιμήστε <b>Microsoft Edge</b> ή <b>Google Chrome</b>.
+                          </>
+                        )}
+                      </li>
+                      <li>
+                        {helpLang === 'en' ? (
+                          <>
+                            <b>Updates feel slow:</b> the app watches <b>workspace</b> in near real-time (polling) — usually within a few seconds.
+                          </>
+                        ) : (
+                          <>
+                            <b>Αργεί να ενημερωθεί:</b> η εφαρμογή διαβάζει το <b>workspace</b> σε πραγματικό χρόνο (polling) — συνήθως σε λίγα δευτερόλεπτα.
+                          </>
+                        )}
+                      </li>
+                    </ul>
+                  </div>
+                </div>
+              ) : (
+                <div className="help-doc-scroll">
+                  <div className="help-doc">
+                    <p className="help-lead">
+                      {helpLang === 'en'
+                        ? 'Application for viewing thermal/RGB imagery, managing labels/faults, and creating reports.'
+                        : 'Εφαρμογή για προβολή θερμικών/RGB εικόνων, διαχείριση labels/faults και δημιουργία report.'}
+                    </p>
+
+                    <h3>{helpLang === 'en' ? 'Versions' : 'Versions'}</h3>
+                    <div className="help-kv">
+                      <div className="help-kv-row">
+                        <div className="help-kv-key">Frontend</div>
+                        <div className="help-kv-value">
+                          {helpLang === 'en' ? (
+                            <>
+                              App: <b>{__APP_VERSION__}</b> · React: <b>{__REACT_VERSION__}</b> · Vite: <b>{__VITE_VERSION__}</b> · TypeScript:{' '}
+                              <b>{__TS_VERSION__}</b> · Build: <b>{buildTimeLocal}</b>
+                            </>
+                          ) : (
+                            <>
+                              App: <b>{__APP_VERSION__}</b> · React: <b>{__REACT_VERSION__}</b> · Vite: <b>{__VITE_VERSION__}</b> · TypeScript:{' '}
+                              <b>{__TS_VERSION__}</b> · Build: <b>{buildTimeLocal}</b>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="help-kv-row">
+                        <div className="help-kv-key">Backend</div>
+                        <div className="help-kv-value">
+                          {backendHealth?.versions ? (
+                            <>
+                              {Object.entries(backendHealth.versions)
+                                .sort(([a], [b]) => a.localeCompare(b))
+                                .map(([k, v], idx, arr) => (
+                                  <span key={k}>
+                                    {k}: <b>{v}</b>
+                                    {idx < arr.length - 1 ? ' · ' : ''}
+                                  </span>
+                                ))}
+                            </>
+                          ) : (
+                            <>
+                              {helpLang === 'en'
+                                ? backendHealthError || 'Not available (start FastAPI).'
+                                : backendHealthError || 'Δεν είναι διαθέσιμο (ξεκινήστε το FastAPI).'}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <h3>{helpLang === 'en' ? 'Developed by' : 'Αναπτύχθηκε από'}</h3>
+                    <div className="help-kv">
+                      <div className="help-kv-row">
+                        <div className="help-kv-key">Name</div>
+                        <div className="help-kv-value">{helpLang === 'en' ? <b>Gavriil Ilikidis</b> : <b>Γαβριήλ Ηλικίδης</b>}</div>
+                      </div>
+                      <div className="help-kv-row">
+                        <div className="help-kv-key">Company</div>
+                        <div className="help-kv-value">
+                          {helpLang === 'en' ? (
+                            <>
+                              Built for <b>TOPOSOL</b>
+                            </>
+                          ) : (
+                            <>
+                              Δημιουργήθηκε για την <b>TOPOSOL</b>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                      <div className="help-kv-row">
+                        <div className="help-kv-key">Contact</div>
+                        <div className="help-kv-value">
+                          {helpLang === 'en' ? (
+                            <>
+                              Support: <b>gabrielilikidis@gmail.com</b>
+                            </>
+                          ) : (
+                            <>
+                              Υποστήριξη: <b>gabrielilikidis@gmail.com</b>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="help-footnote">
+                      {helpLang === 'en' ? (
+                        <>
+                          For usage instructions: <b>Help → Documentation</b>. For folder access issues: try <b>Edge</b>/<b>Chrome</b>.
+                        </>
+                      ) : (
+                        <>
+                          Για χρήση: <b>Help → Documentation</b>. Για θέματα πρόσβασης φακέλων: δοκιμάστε <b>Edge</b>/<b>Chrome</b>.
+                        </>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+
+          {activeMenu !== 'file' && activeMenu !== 'actions' && activeMenu !== 'help' && (
             <section className="card">
               <h2>Status</h2>
               <p>{message}</p>
@@ -8431,7 +9678,7 @@ function App() {
 
           
 
-          {activeMenu !== 'actions' && activeMenu !== 'file' && (
+          {activeMenu !== 'actions' && activeMenu !== 'file' && activeMenu !== 'help' && (
             <section className="card viewer">
               <h3>Preview</h3>
               {!selectedPath && <p>Select a file from the explorer.</p>}
@@ -8467,7 +9714,24 @@ function App() {
                     <div className="explorer-pane-title">Fault labels</div>
                     <div className="tree">
                       {selectedLabels.length === 0 && (
-                        <div className="explorer-empty">No faults for this image.</div>
+                        <div className="explorer-empty">
+                          {openedThermalFolderDirectly
+                            ? 'You opened the “thermal” folder directly. Open the parent folder that contains “thermal/” and “workspace/” so the app can read workspace/thermal_labels.'
+                            : openedRgbFolderDirectly
+                              ? 'You opened the “rgb” folder directly. Open the parent folder that contains “thermal/” (and “workspace/”) so the app can read workspace/thermal_labels.'
+                              : (() => {
+                                  if (!selectedPath) return 'No faults for this image.'
+                                  const expected = getExpectedThermalLabelPaths(selectedPath)
+                                  const lines = [
+                                    'No faults for this image.',
+                                    `Expected: ${expected.flat} (${expected.flatExists ? 'loaded' : 'missing'})`,
+                                  ]
+                                  if (expected.nested) {
+                                    lines.push(`Nested: ${expected.nested} (${expected.nestedExists ? 'loaded' : 'missing'})`)
+                                  }
+                                  return lines.join('\n')
+                                })()}
+                        </div>
                       )}
                       {selectedLabels.map((label, index) => (
                         <button
@@ -8998,14 +10262,14 @@ function App() {
                             }
                             title={
                               rgbLabelsExportStatus === 'checking'
-                                ? 'Checking rgb/labels…'
+                                ? 'Checking workspace/rgb_labels…'
                                 : !rgbLabelsExportDirty
                                   ? 'Edit/move/resize RGB labels to enable saving'
                                   : rgbLabelsExportFileExists
                                     ? rgbLabelsExportFileEmpty
-                                      ? 'Save RGB labels to fill the empty rgb/labels file'
-                                      : 'Save (overwrite) RGB labels in rgb/labels'
-                                    : 'Save RGB labels to rgb/labels'
+                                      ? 'Save RGB labels to fill the empty workspace/rgb_labels file'
+                                      : 'Save (overwrite) RGB labels in workspace/rgb_labels'
+                                    : 'Save RGB labels to workspace/rgb_labels'
                             }
                           >
                             Save
@@ -9030,6 +10294,8 @@ function App() {
           </>
         )}
       </div>
+
+      <footer className="app-footer">© 2026 TOPOSOL. Software by Gavriil Ilikidis.</footer>
 
       {explorerContextMenu && (
         <div
