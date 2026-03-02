@@ -1,0 +1,14 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.fly
+    ports:
+      - "80:8080"
+    environment:
+      PORT: "8080"
+      CORS_ALLOW_ORIGINS: "*"
+      FAULT_MODEL_PATH: "/app/backend/models/best.pt"
+      FAULT_TYPE_MODEL_PATH: "/app/backend/models/best_8_class.pt"
+      PRELOAD_MODEL: "0"
+    restart: unless-stopped

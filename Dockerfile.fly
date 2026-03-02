@@ -10,7 +10,7 @@ ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 RUN npm run build
 
 # Build backend deps
-FROM python:3.12-slim AS backend-base
+FROM python:3.11-slim AS backend-base
 
 # Runtime deps:
 # - OpenCV: libgl1 libglib2.0-0
@@ -23,19 +23,34 @@ RUN apt-get update \
     libgl1 \
     libglib2.0-0 \
     libgomp1 \
-    libreoffice \
+    libreoffice-writer \
     fonts-dejavu-core \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY backend/requirements.txt backend/requirements.txt
-RUN pip install --no-cache-dir -r backend/requirements.txt
+# Install torch explicitly.
+# - On amd64, force CPU-only wheels (keeps images small and avoids CUDA pulls).
+# - On arm64 (Oracle Ampere), fall back to PyPI wheels.
+RUN arch="$(dpkg --print-architecture)" \
+  && if [ "$arch" = "amd64" ]; then \
+      pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch; \
+    else \
+      pip install --no-cache-dir torch; \
+    fi \
+  && pip install --no-cache-dir -r backend/requirements.txt
 
 COPY backend/ backend/
 
 # Download Caddy static binary (Fly terminates TLS at the edge; we serve HTTP)
-RUN curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64" -o /usr/local/bin/caddy \
+RUN arch="$(dpkg --print-architecture)" \
+  && case "$arch" in \
+    amd64) caddy_arch="amd64" ;; \
+    arm64) caddy_arch="arm64" ;; \
+    *) echo "Unsupported architecture: $arch"; exit 1 ;; \
+  esac \
+  && curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=${caddy_arch}" -o /usr/local/bin/caddy \
   && chmod +x /usr/local/bin/caddy
 
 # Copy frontend dist

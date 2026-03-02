@@ -10108,7 +10108,7 @@ function App() {
         )}
       </div>
 
-      <footer className="app-footer">© 2026 TOPOSOL. Software by Gavriil Ilikidis.</footer>
+      <footer className="app-footer">© 2026 By Gavriil Ilikidis for TOPOSOL. All rights reserved.</footer>
 
       {explorerContextMenu && (
         <div
