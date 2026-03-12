@@ -66,7 +66,7 @@ Notes:
 - Ensure ports 80/443 are open in the firewall/security group.
 - If you don't have a domain yet, you can run HTTP-only by setting `DOMAIN=:80` (no TLS).
 
-## Deploy (free, no domain) on Fly.io
+## Deploy on Fly.io
 
 This repo includes a single-container Fly setup that:
 - runs the FastAPI backend on `127.0.0.1:8000`
